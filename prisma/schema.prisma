@@ -1,0 +1,17 @@
+// Prisma Schema 文件
+// 用于生成 PostgreSQL 的 Prisma Client
+// 注意：本项目中只使用 Prisma Client 执行原始 SQL，不定义任何 model
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// PostgreSQL 数据源
+datasource pg {
+  provider = "postgresql"
+  url      = env("POSTGRESQL_URL")
+}
+
+// 注意：本项目使用原始 SQL 查询（$queryRawUnsafe / $executeRawUnsafe）
+// 表结构定义在 database-schema.sql 中，不需要在这里定义 model
+

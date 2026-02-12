@@ -1,0 +1,30 @@
+{
+  "name": "sql-to-pg-sync",
+  "version": "1.0.0",
+  "description": "实时同步 SQL Server 数据到 PostgreSQL",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "sync": "node src/sync-simple.js",
+    "dev": "node --watch src/index.js",
+    "prisma:generate": "prisma generate"
+  },
+  "keywords": [
+    "sql-server",
+    "postgresql",
+    "sync",
+    "prisma"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@prisma/client": "^5.7.1",
+    "dotenv": "^16.3.1",
+    "mssql": "^10.0.1"
+  },
+  "devDependencies": {
+    "prisma": "^5.7.1"
+  }
+}
+
