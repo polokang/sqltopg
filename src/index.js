@@ -1,11 +1,8 @@
 import dotenv from 'dotenv';
 import http from 'http';
-import { PrismaClient } from '@prisma/client';
 import { syncAllTables } from './sync-simple.js';
 
 dotenv.config();
-
-const prisma = new PrismaClient();
 
 const PORT = process.env.PORT || 3000;
 const SYNC_INTERVAL_MS = 2 * 60 * 1000; // 2分钟
@@ -128,14 +125,6 @@ function setupGracefulShutdown(server) {
       while (syncStatus.isRunning) {
         await new Promise(resolve => setTimeout(resolve, 1000));
       }
-    }
-
-    // 断开 Prisma 连接
-    try {
-      await prisma.$disconnect();
-      console.log('✓ Prisma 连接已断开');
-    } catch (error) {
-      console.error('断开 Prisma 连接时出错:', error.message);
     }
 
     console.log('✓ 服务已安全关闭');

@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node -e \"require\\('mssql'\\)\")",
+      "Bash(node src/migration-base.js)",
+      "Bash(npm install:*)",
+      "Bash(node -e ' *)",
+      "Bash(npm uninstall *)"
+    ]
+  }
+}

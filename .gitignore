@@ -7,7 +7,7 @@ node_modules/
 # Prisma
 prisma/migrations/
 
-# 日志
+# 日志 
 *.log
 
 # 编辑器

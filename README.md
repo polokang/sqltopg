@@ -1,203 +1,179 @@
-# SQL Server 到 PostgreSQL 数据同步工具
+# sqltopg — SQL Server 到 PostgreSQL 数据同步工具
 
-实时同步 SQL Server 数据库中的数据到 PostgreSQL 数据库，支持增量同步和自动表结构创建。
+把 SQL Server（`AquariusEmailDB`）中的业务数据搬运到 PostgreSQL（`AquariusPG`），并可作为常驻服务持续同步。
 
-## 功能特点
+项目提供两种用法：
 
-- ✅ 自动创建 PostgreSQL 表结构
-- ✅ 增量同步（只同步变化的记录）
-- ✅ 定时同步（每2分钟自动执行）
-- ✅ 健康检查端点（端口 3000）
-- ✅ Docker 支持
+1. **一次性迁移** —— 用 `migration-*.js` 脚本一次性搬完数据（推荐用于首次初始化）。
+2. **定时增量同步** —— `index.js` 启动一个常驻进程，每 2 分钟做一次全量 UPSERT + 孤儿清理，并暴露 HTTP 健康检查。
 
-## 同步的表
+---
 
-程序会同步以下 SQL Server 表到 PostgreSQL：
+## 目录结构
 
-| SQL Server 表 | PostgreSQL 表 | 说明 |
-|--------------|--------------|------|
-| `UserInfomation` | `users` + `user_profiles` | 用户核心信息和扩展信息 |
-| `ControllerInfo` | `controllers` | 控制器（设备）信息 |
-| `UserControllerAssignment` | `controller_user_assignments` | 用户-控制器权限关系 |
-| `ControllerNotes` | `controller_notes` | 控制器备注记录（厂家修改记录） |
-
-### 表关系说明
-
-- **users**: 用户核心信息（UserId, Email, Name 等）
-- **user_profiles**: 用户扩展信息（登录时间、验证状态等）
-- **controllers**: 控制器信息（UnitId, SIMCardNo, SystemID 等）
-- **controller_user_assignments**: 用户对控制器的权限关系（多对多）
-- **controller_notes**: 控制器备注记录（同步自 SQL Server ControllerNotes 表）
-
-## 本地测试
-
-### 1. 安装依赖
-
-```bash
-npm install
+```
+src/
+├── initDatabase.js              # 删除并重建 PG 所有表/视图
+├── migration-user.js            # 迁移 UserInfomation → "UserInfo"
+├── migration-company.js         # 迁移 UserInfomation → "CompanyInfo"
+├── migration-controller.js      # 迁移 ControllerInfo → "ControllerInfo"
+├── migration-assignment.js      # 迁移 UserControllerAssignment → "UserControllerAssignment"
+├── progress.js                  # 进度条输出工具
+├── sync-simple.js               # 常驻同步逻辑（UPSERT + 孤儿清理）
+└── index.js                     # 定时任务 + 健康检查服务入口
+Dockerfile                       # 运行定时同步服务的镜像
 ```
 
-### 2. 配置环境变量
+---
 
-复制 `env.example` 为 `.env`：
+## 目标 Schema（PostgreSQL，全部 PascalCase）
 
-```bash
-cp env.example .env
-```
+| 表 / 视图                    | 说明                                                           |
+| ---------------------------- | -------------------------------------------------------------- |
+| `"UserInfo"`                 | 用户信息（合并了老 schema 中的 `users` + `user_profiles`）     |
+| `"CompanyInfo"`              | 公司信息                                                       |
+| `"UserIdentity"`             | 第三方身份认证绑定（Google/GitHub 等）                         |
+| `"UserMfaFactor"`            | 多因子认证因子（TOTP/SMS/...）                                 |
+| `"ControllerInfo"`           | 控制器设备信息                                                 |
+| `"UserControllerAssignment"` | 用户-控制器权限关系                                            |
+| 视图 `"UserFullInfo"`        | UserInfo 的只读投影                                            |
+| 视图 `"ControllerUserPermissions"` | 权限关系 + 用户 + 控制器联合视图                         |
+| 视图 `"UserControllers"`     | 激活用户可访问的激活控制器                                     |
 
-编辑 `.env` 文件：
+### `Permission` 字段（SMALLINT）
 
-```env
-# SQL Server 连接字符串
-SQL_SERVER_URL=sqlserver://host:1433;database=dbname;user=username;password=password;trustServerCertificate=true
+`UserControllerAssignment.Permission` 为数值，数字越大权限越高，中间留有空位以便未来扩展（例如 `VIEWER=20`、`EDITOR=70`）：
 
-# PostgreSQL 数据库配置
-POSTGRESQL_URL=postgresql://username:password@localhost:5432/database_name?schema=public
+| 值  | 名称       | 含义                 |
+| --- | ---------- | -------------------- |
+| 0   | `READONLY` | 只读                 |
+| 50  | `NORMAL`   | 默认工作权限         |
+| 100 | `OWNER`    | 控制器的所有者权限   |
 
-# 可选：HTTP 服务端口（默认 3000）
-PORT=3000
-```
+详见 `src/initDatabase.js` 中 `UserControllerAssignment` 建表处的注释。
 
-### 3. 生成 Prisma Client
-
-```bash
-npm run prisma:generate
-```
-
-### 4. 运行同步
-
-#### 单次同步（测试用）
-
-```bash
-npm run sync
-```
-
-#### 启动定时同步服务（每2分钟自动同步）
-
-```bash
-npm start
-```
-
-服务启动后会：
-- 立即执行一次全量同步
-- 之后每2分钟自动执行增量同步
-- 启动健康检查服务（端口 3000）
-
-#### 检查健康状态
-
-```bash
-curl http://localhost:3000/health
-```
-
-或在浏览器访问：`http://localhost:3000/health`
-
-## Docker 部署
-
-### 1. 构建镜像
-
-```bash
-docker build -t adminpage.azurecr.io/sqltopg:v1.0 .
-```
-
-### 2. 推送镜像到 Azure Container Registry
-
-```bash
-# 登录（如果需要）
-az acr login --name adminpage
-
-# 推送镜像
-docker push adminpage.azurecr.io/sqltopg:v1.0
-```
-
-### 3. 运行容器
-
-```bash
-docker run -d \
-  --name sqltopg \
-  -p 3000:3000 \
-  --env-file .env \
-  adminpage.azurecr.io/sqltopg:v1.0
-```
-
-> **注意**: `.env` 文件已经打包到镜像中，也可以直接运行（不指定 `--env-file`）。
-
-### 4. 查看日志
-
-```bash
-docker logs -f sqltopg
-```
-
-### 5. 停止容器
-
-```bash
-docker stop sqltopg
-docker rm sqltopg
-```
-
-## 同步机制
-
-### 首次同步（全量）
-
-- 删除并重建所有表结构
-- 清空表并插入所有记录
-
-### 后续同步（增量）
-
-- 自动检测表是否为空
-- 比较源数据库和目标数据库的差异
-- 只同步新增、更新、删除的记录
-- 记录所有变更日志
-
-### 同步频率
-
-- 默认每 **2 分钟**执行一次同步
-- 可通过修改 `src/index.js` 中的 `SYNC_INTERVAL_MS` 调整
+---
 
 ## 环境变量
 
-| 变量名 | 说明 | 必需 | 默认值 |
-|--------|------|------|--------|
-| `SQL_SERVER_URL` | SQL Server 连接字符串 | 是 | - |
-| `POSTGRESQL_URL` | PostgreSQL 连接字符串 | 是 | - |
-| `PORT` | HTTP 服务端口 | 否 | 3000 |
+在项目根目录创建 `.env`：
 
-## 项目结构
+```bash
+# SQL Server 源库
+SQL_SERVER_URL=sqlserver://<host>:1433;database=AquariusEmailDB;user=<user>;password=<pw>;trustServerCertificate=true
 
-```
-sqltopg/
-├── src/
-│   ├── index.js              # 主程序入口（定时同步服务）
-│   └── sync-simple.js        # 同步逻辑实现
-├── prisma/
-│   └── schema.prisma         # Prisma schema（仅用于生成 Client，不定义 model）
-├── database-schema.sql        # PostgreSQL 表结构定义
-├── Dockerfile                 # Docker 镜像构建文件
-├── package.json               # 项目依赖
-└── README.md                  # 本文档
+# PostgreSQL 目标库
+POSTGRESQL_URL=postgresql://<user>:<pw>@<host>:5432/AquariusPG
+
+# 同步服务 HTTP 端口（index.js 使用，可选，默认 3000）
+PORT=3000
 ```
 
-## 注意事项
+---
 
-1. **首次运行**：程序会自动创建所有表结构，无需手动创建
-2. **数据完整性**：程序会按外键依赖顺序同步表，确保数据完整性
-3. **增量同步**：只有真正有字段变化的记录才会被更新，减少数据库负载
-4. **错误处理**：同步失败不会影响其他表的同步，错误会记录到日志中
+## 一次性迁移（推荐首次初始化）
 
-## 故障排查
+```bash
+npm install
+npm run migrate
+```
 
-### 连接失败
+`migrate` 按顺序执行：
 
-- 检查 `.env` 文件配置是否正确
-- 检查网络连接和防火墙设置
-- 检查数据库服务是否运行
+```
+initDatabase.js  →  migration-user.js  →  migration-company.js
+                 →  migration-controller.js  →  migration-assignment.js
+```
 
-### 表不存在错误
+也可以单独运行其中一步：
 
-- 重新运行同步，程序会自动创建表结构
-- 检查 `database-schema.sql` 文件是否存在
+| Script                       | 作用                                                             |
+| ---------------------------- | ---------------------------------------------------------------- |
+| `npm run init-db`            | **删除并重建**所有表、视图、触发器（⚠ 会清空目标数据库）         |
+| `npm run migrate:user`       | 迁移用户 + 角色派生 + Email 去重                                 |
+| `npm run migrate:company`    | 迁移公司，暂停 `ManagerId` 外键，并插入 Rare-Enviro 手工数据     |
+| `npm run migrate:controller` | 迁移控制器（JOIN 取 CompanyId/BillingEmail，Suburb 拆为 Tags）   |
+| `npm run migrate:assignment` | 迁移权限关系（AccessLevel → Permission 数值映射）                |
 
-### 同步不工作
+**角色派生规则**（由 `migration-user.js` 定义）：
 
-- 查看日志输出
-- 检查数据是否被过滤（如无效 UserId）
-- 访问健康检查端点查看同步状态
+- `UserTypeId = 22` → `['super']`，`ManagedCompanyIds = []`
+- `Production = 1` → 追加 `['manager', 'owner']`，`ManagedCompanyIds = [CompanyId]`
+- `UserTypeId = 24`（且未被上一条覆盖） → 追加 `['manager']`，`ManagedCompanyIds = [CompanyId]`
+- 以上都不满足 → `['operator']`
+
+**Name 回退顺序**：`UserName → Name → Email`。`Email` 为 NULL 的记录整条丢弃。
+
+---
+
+## 常驻同步服务
+
+```bash
+npm start          # 生产启动
+npm run dev        # 监听文件变化启动
+npm run sync       # 执行一次 sync 后退出（便于手动触发）
+```
+
+- 默认每 **2 分钟**执行一次同步（可在 `src/index.js` 里改 `SYNC_INTERVAL_MS`）
+- 同步模型：**全量 UPSERT + 孤儿清理**，每次运行都是幂等的
+- 同步以下三张表：`"UserInfo"`、`"ControllerInfo"`、`"UserControllerAssignment"`
+- 不同步的表：`"CompanyInfo"`（由 migration 脚本一次性迁移，后续应由应用侧维护）、`"UserIdentity"`、`"UserMfaFactor"`（应用侧数据，不受源库影响）
+- 全程单事务，出错 `ROLLBACK`
+
+### 健康检查
+
+启动后访问：
+
+```
+GET http://localhost:3000/health
+```
+
+返回：
+
+```json
+{
+  "status": "ok",
+  "service": "sql-to-pg-sync",
+  "timestamp": "2026-04-22T03:00:00.000Z",
+  "sync": {
+    "isRunning": false,
+    "lastSyncTime": "...",
+    "syncCount": 12,
+    "lastError": null
+  }
+}
+```
+
+---
+
+## Docker 部署
+
+```bash
+docker build -t sqltopg:latest .
+docker run -d --name sqltopg -p 3000:3000 --env-file .env sqltopg:latest
+```
+
+镜像只包含运行时依赖 (`dotenv` / `mssql` / `pg`)，启动后直接运行 `src/index.js`。
+
+> ⚠ 当前 `Dockerfile` 把 `.env` `COPY` 进了镜像，仅适合个人/内部使用。生产环境建议改为 `--env-file` 或 K8s Secret 注入。
+
+---
+
+## 依赖
+
+```
+dotenv ^16.3.1
+mssql  ^10.0.1
+pg     ^8.20.0
+```
+
+Node.js **18+**。
+
+---
+
+## 常见问题排查
+
+- **`relation "UserInfo" does not exist`** —— 目标库还没初始化，先跑一次 `npm run init-db` 或 `npm run migrate`。
+- **`null value in column "Name"`** —— SQL Server 里对应记录 `UserName`、`Name`、`Email` 全为 NULL；按设计这种行会被丢弃，请检查源数据。
+- **FK 约束报错（`CompanyId_fkey` / `OwnerId_fkey` / ...）** —— 通常是源数据有孤立引用。migration 脚本会先诊断并打印出所有孤儿行，再决定是否恢复约束；`sync-simple.js` 在运行时直接把找不到对应父行的 FK 值置 NULL（或跳过整行）。
+- **同步服务启动就报错退出** —— 先用 `npm run sync` 在前台跑一次，观察完整堆栈。
