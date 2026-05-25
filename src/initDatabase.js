@@ -108,22 +108,40 @@ async function initDatabase() {
     `);
 
     // ── 7. UserIdentity ───────────────────────────────────────────────────────
+    // Stores one row per external/linked login method for a user. Examples:
+    //   Provider='password' | 'google' | 'passkey' | …
+    //
+    // For Passkey (WebAuthn) rows:
+    //   ProviderUserId → base64url(credentialId)         (UNIQUE per provider)
+    //   FriendlyName   → user-supplied label, e.g. "Hunter's MacBook"
+    //   IdentityData   → JSONB blob with WebAuthn material:
+    //     {
+    //       "publicKey":  "<base64url COSE>",   -- required for verification
+    //       "counter":    0,                     -- monotonic replay guard
+    //       "transports": ["internal","hybrid"],
+    //       "deviceType": "singleDevice|multiDevice",
+    //       "backedUp":   true,
+    //       "aaguid":     "<uuid>"
+    //     }
     console.log('Creating "UserIdentity"...');
     await client.query(`
       CREATE TABLE "UserIdentity" (
         "Id"                   UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
         "UserId"               INTEGER      NOT NULL REFERENCES "UserInfo"("UserId") ON DELETE CASCADE,
         "Provider"             VARCHAR(50)  NOT NULL,
-        "ProviderUserId"       VARCHAR(255) NOT NULL,
+        "ProviderUserId"       VARCHAR(512) NOT NULL,
         "ProviderEmail"        VARCHAR(100),
         "ProviderEmailVerified" BOOLEAN,
+        "FriendlyName"         VARCHAR(120),
+        "IdentityData"         JSONB,
         "LinkedAt"             TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
         "LastUsedAt"           TIMESTAMP WITH TIME ZONE,
         CONSTRAINT "UserIdentity_Provider_ProviderUserId_unique" UNIQUE ("Provider", "ProviderUserId")
       );
     `);
-    await client.query(`CREATE INDEX idx_useridentity_user_id  ON "UserIdentity"("UserId");`);
-    await client.query(`CREATE INDEX idx_useridentity_provider ON "UserIdentity"("Provider");`);
+    await client.query(`CREATE INDEX idx_useridentity_user_id       ON "UserIdentity"("UserId");`);
+    await client.query(`CREATE INDEX idx_useridentity_provider      ON "UserIdentity"("Provider");`);
+    await client.query(`CREATE INDEX idx_useridentity_user_provider ON "UserIdentity"("UserId","Provider");`);
 
     // ── 8. UserMfaFactor ──────────────────────────────────────────────────────
     console.log('Creating "UserMfaFactor"...');
