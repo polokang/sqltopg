@@ -65,6 +65,13 @@ import {
   nullIfBlank,
 } from './derive.js';
 import { startRun, finishRun } from './syncLog.js';
+import {
+  upsertChunked,
+  UPSERT_COMPANIES,
+  UPSERT_USERS,
+  UPSERT_CONTROLLERS,
+  UPSERT_ASSIGNMENTS,
+} from './upserts.js';
 
 dotenv.config();
 
@@ -140,42 +147,25 @@ async function syncCompanies(pgClient, mssqlPool) {
   // 等 syncUsers 跑完再由 backfillCompanyManagers 回填。
   const pendingManagers = [];
   const validCompanyIds = new Set();
-  let upserted = 0;
 
-  for (const row of rows) {
-    const res = await pgClient.query(
-      `INSERT INTO companies
-         (company_id, name, phone, email, logo_url, activated, created_at, updated_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-       ON CONFLICT (company_id) DO UPDATE SET
-         name       = EXCLUDED.name,
-         phone      = EXCLUDED.phone,
-         email      = EXCLUDED.email,
-         logo_url   = EXCLUDED.logo_url,
-         activated  = EXCLUDED.activated,
-         updated_at = EXCLUDED.updated_at
-       WHERE (companies.name, companies.phone, companies.email,
-              companies.logo_url, companies.activated, companies.updated_at)
-         IS DISTINCT FROM
-             (EXCLUDED.name, EXCLUDED.phone, EXCLUDED.email,
-              EXCLUDED.logo_url, EXCLUDED.activated, EXCLUDED.updated_at)`,
-      [
-        row.CompanyId,
-        String(row.CompanyName).trim(),
-        nullIfBlank(row.Phone),
-        nullIfBlank(row.Email),
-        nullIfBlank(row.CompanyLogoName) ?? 'YourLogoGoesToHere.JPG',
-        toBool(row.Activated),
-        row.DateCreated,
-        row.LastUpdateDate,
-      ],
-    );
+  const payload = rows.map((row) => {
     if (row.ManagerUserId != null) {
       pendingManagers.push({ companyId: row.CompanyId, managerUserId: row.ManagerUserId });
     }
     validCompanyIds.add(row.CompanyId);
-    upserted += res.rowCount;
-  }
+    return {
+      company_id: row.CompanyId,
+      name:       String(row.CompanyName).trim(),
+      phone:      nullIfBlank(row.Phone),
+      email:      nullIfBlank(row.Email),
+      logo_url:   nullIfBlank(row.CompanyLogoName) ?? 'YourLogoGoesToHere.JPG',
+      activated:  toBool(row.Activated),
+      created_at: row.DateCreated,
+      updated_at: row.LastUpdateDate,
+    };
+  });
+
+  const upserted = await upsertChunked(pgClient, UPSERT_COMPANIES, payload);
 
   // ⚠️ companies 刻意**不做孤儿清理**：company_id 是 SERIAL，Pro 侧可能建过公司；
   //    而且删公司会经 controllers.company_id 的 ON DELETE SET NULL 让整批设备失去
@@ -230,69 +220,32 @@ async function syncUsers(pgClient, mssqlPool) {
   }
 
   const validUserIds = new Set();
-  let upserted = 0;
 
-  for (const row of rows) {
-    const res = await pgClient.query(
-      `INSERT INTO users (
-         user_id, company_id, email, email_verified, mobile, mobile_verified,
-         name, password_hash, avatar_url, jw_code,
-         roles, managed_company_ids, activated, mfa_enabled,
-         last_login_at, created_at, updated_at
-       )
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
-       ON CONFLICT (user_id) DO UPDATE SET
-         company_id      = EXCLUDED.company_id,
-         email           = EXCLUDED.email,
-         email_verified  = EXCLUDED.email_verified,
-         mobile          = EXCLUDED.mobile,
-         mobile_verified = EXCLUDED.mobile_verified,
-         name            = EXCLUDED.name,
-         password_hash   = EXCLUDED.password_hash,
-         avatar_url      = EXCLUDED.avatar_url,
-         jw_code         = EXCLUDED.jw_code,
-         roles           = EXCLUDED.roles,
-         activated       = EXCLUDED.activated,
-         mfa_enabled     = EXCLUDED.mfa_enabled,
-         last_login_at   = EXCLUDED.last_login_at,
-         updated_at      = EXCLUDED.updated_at
-       WHERE (users.company_id, users.email, users.email_verified, users.mobile,
-              users.mobile_verified, users.name, users.password_hash, users.avatar_url,
-              users.jw_code, users.roles, users.activated, users.mfa_enabled,
-              users.last_login_at, users.updated_at)
-         IS DISTINCT FROM
-             (EXCLUDED.company_id, EXCLUDED.email, EXCLUDED.email_verified, EXCLUDED.mobile,
-              EXCLUDED.mobile_verified, EXCLUDED.name, EXCLUDED.password_hash, EXCLUDED.avatar_url,
-              EXCLUDED.jw_code, EXCLUDED.roles, EXCLUDED.activated, EXCLUDED.mfa_enabled,
-              EXCLUDED.last_login_at, EXCLUDED.updated_at)`,
-      //  ↑ DO UPDATE 刻意不含 managed_company_ids —— 不变式 I3。SQL Server 没有这个
-      //    字段，它由 Pro 人工维护，覆盖会把跨公司的 Manager 范围冲掉。
-      //
-      //  ↑ WHERE 子句让**没有变化的行完全不被写**：否则每轮同步都会重写全部 5000 行，
-      //    触发器把 updated_at 打成 NOW()，同步就不幂等了（WAL/表膨胀同理）。
-      [
-        row.UserId,
-        row.CompanyId,
-        row.Email,
-        toBool(row.Activated),                    // email_verified
-        deriveMobile(row.Mobile),
-        toBool(row.IsPhoneVerified),              // mobile_verified
-        deriveUserName(row),
-        row.PasswordHash || '',
-        row.Logo || null,                         // avatar_url
-        deriveJwCode(row.JWCode),
-        deriveRoles(row.UserTypeId),
-        deriveManagedCompanyIds(row.UserTypeId, row.CompanyId), // 仅 INSERT 时生效
-        toBool(row.Activated),
-        toBool(row.RequiresTwoFactorAuth),        // mfa_enabled
-        row.LastLoginTime || null,
-        row.DateCreated,
-        row.LastUpdateDate,
-      ],
-    );
+  const payload = rows.map((row) => {
     validUserIds.add(row.UserId);
-    upserted += res.rowCount;
-  }
+    return {
+      user_id:             row.UserId,
+      company_id:          row.CompanyId,
+      email:               row.Email,
+      email_verified:      toBool(row.Activated),
+      mobile:              deriveMobile(row.Mobile),
+      mobile_verified:     toBool(row.IsPhoneVerified),
+      name:                deriveUserName(row),
+      password_hash:       row.PasswordHash || '',
+      avatar_url:          row.Logo || null,
+      jw_code:             deriveJwCode(row.JWCode),
+      roles:               deriveRoles(row.UserTypeId),
+      // 仅 INSERT 时生效 —— 不变式 I3，UPSERT_USERS 的 DO UPDATE 不含此列
+      managed_company_ids: deriveManagedCompanyIds(row.UserTypeId, row.CompanyId),
+      activated:           toBool(row.Activated),
+      mfa_enabled:         toBool(row.RequiresTwoFactorAuth),
+      last_login_at:       row.LastLoginTime || null,
+      created_at:          row.DateCreated,
+      updated_at:          row.LastUpdateDate,
+    };
+  });
+
+  const upserted = await upsertChunked(pgClient, UPSERT_USERS, payload);
 
   // 孤儿清理：只删来自 SQL Server 的行（不变式 I2）
   const del = await pgClient.query(
@@ -332,11 +285,10 @@ async function syncControllers(pgClient, mssqlPool, validUserIds, validCompanyId
   console.log(`  Read ${rows.length} source rows`);
 
   const validUnitIds = new Set();
-  let upserted = 0;
   let nulledOwner = 0;
   let nulledCompany = 0;
 
-  for (const row of rows) {
+  const payload = rows.map((row) => {
     // 外键目标不在 PG 时置 NULL，而不是让整轮同步失败
     let ownerId = row.AccManagerId ?? null;
     if (ownerId != null && !validUserIds.has(ownerId)) { ownerId = null; nulledOwner++; }
@@ -344,72 +296,32 @@ async function syncControllers(pgClient, mssqlPool, validUserIds, validCompanyId
     let companyId = row.CompanyId ?? null;
     if (companyId != null && !validCompanyIds.has(companyId)) { companyId = null; nulledCompany++; }
 
-    const res = await pgClient.query(
-      `INSERT INTO controllers (
-         unit_id, serial_no, sim_card_no, owner_user_id, company_id,
-         system_id, firmware_version, model_type, timezone_id, production_status,
-         activated, created_at, updated_at, site_location, tags, billing_email,
-         bar_code, po_number, spare_parts, notes
-       )
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
-       ON CONFLICT (unit_id) DO UPDATE SET
-         serial_no         = EXCLUDED.serial_no,
-         sim_card_no       = EXCLUDED.sim_card_no,
-         owner_user_id     = EXCLUDED.owner_user_id,
-         company_id        = EXCLUDED.company_id,
-         system_id         = EXCLUDED.system_id,
-         firmware_version  = EXCLUDED.firmware_version,
-         model_type        = EXCLUDED.model_type,
-         timezone_id       = EXCLUDED.timezone_id,
-         production_status = EXCLUDED.production_status,
-         activated         = EXCLUDED.activated,
-         updated_at        = EXCLUDED.updated_at,
-         site_location     = EXCLUDED.site_location,
-         tags              = EXCLUDED.tags,
-         billing_email     = EXCLUDED.billing_email,
-         bar_code          = EXCLUDED.bar_code,
-         po_number         = EXCLUDED.po_number,
-         spare_parts       = EXCLUDED.spare_parts,
-         notes             = EXCLUDED.notes
-       WHERE (controllers.serial_no, controllers.sim_card_no, controllers.owner_user_id,
-              controllers.company_id, controllers.system_id, controllers.firmware_version,
-              controllers.model_type, controllers.timezone_id, controllers.production_status,
-              controllers.activated, controllers.updated_at, controllers.site_location,
-              controllers.tags, controllers.billing_email, controllers.bar_code,
-              controllers.po_number, controllers.spare_parts, controllers.notes)
-         IS DISTINCT FROM
-             (EXCLUDED.serial_no, EXCLUDED.sim_card_no, EXCLUDED.owner_user_id,
-              EXCLUDED.company_id, EXCLUDED.system_id, EXCLUDED.firmware_version,
-              EXCLUDED.model_type, EXCLUDED.timezone_id, EXCLUDED.production_status,
-              EXCLUDED.activated, EXCLUDED.updated_at, EXCLUDED.site_location,
-              EXCLUDED.tags, EXCLUDED.billing_email, EXCLUDED.bar_code,
-              EXCLUDED.po_number, EXCLUDED.spare_parts, EXCLUDED.notes)`,
-      [
-        row.UnitId,
-        row.SerialNo || null,
-        row.SIMCardNo,
-        ownerId,
-        companyId,
-        row.SystemID,
-        row.FirmwareVersion || null,
-        row.ControllerModel || null,
-        row.LinuxTimeZoneId || null,
-        row.ProductionStatus ?? null,
-        toBool(row.Activated),
-        row.DateCreated,
-        row.DateLastUpdate,
-        row.SiteLocation || null,
-        parseTags(row.Suburb),
-        row.BillingEmail || null,
-        row.Barcode || null,
-        row.CustPO || null,
-        row.Serials || null,
-        row.Notes || null,
-      ],
-    );
     validUnitIds.add(row.UnitId);
-    upserted += res.rowCount;
-  }
+    return {
+      unit_id:           row.UnitId,
+      serial_no:         row.SerialNo || null,
+      sim_card_no:       row.SIMCardNo,
+      owner_user_id:     ownerId,
+      company_id:        companyId,
+      system_id:         row.SystemID,
+      firmware_version:  row.FirmwareVersion || null,
+      model_type:        row.ControllerModel || null,
+      timezone_id:       row.LinuxTimeZoneId || null,
+      production_status: row.ProductionStatus ?? null,
+      activated:         toBool(row.Activated),
+      created_at:        row.DateCreated,
+      updated_at:        row.DateLastUpdate,
+      site_location:     row.SiteLocation || null,
+      tags:              parseTags(row.Suburb),
+      billing_email:     row.BillingEmail || null,
+      bar_code:          row.Barcode || null,
+      po_number:         row.CustPO || null,
+      spare_parts:       row.Serials || null,
+      notes:             row.Notes || null,
+    };
+  });
+
+  const upserted = await upsertChunked(pgClient, UPSERT_CONTROLLERS, payload);
 
   const del = await pgClient.query(
     `DELETE FROM controllers
@@ -451,30 +363,18 @@ async function syncAssignments(pgClient, mssqlPool, validUserIds, validUnitIds) 
     `（合并 ${merged}、外键无效跳过 ${skippedFk}）`,
   );
 
-  const keepUserIds = [];
-  const keepUnitIds = [];
-  let upserted = 0;
+  const keepUserIds = rows.map((r) => r.UserId);
+  const keepUnitIds = rows.map((r) => r.UnitId);
 
-  for (const row of rows) {
-    const res = await pgClient.query(
-      `INSERT INTO user_controller_assignments
-         (user_id, unit_id, permission, send_sms_alarm, send_email_alarm)
-       VALUES ($1,$2,$3,$4,$5)
-       ON CONFLICT (user_id, unit_id) DO UPDATE SET
-         permission       = EXCLUDED.permission,
-         send_sms_alarm   = EXCLUDED.send_sms_alarm,
-         send_email_alarm = EXCLUDED.send_email_alarm
-       WHERE (user_controller_assignments.permission,
-              user_controller_assignments.send_sms_alarm,
-              user_controller_assignments.send_email_alarm)
-         IS DISTINCT FROM
-             (EXCLUDED.permission, EXCLUDED.send_sms_alarm, EXCLUDED.send_email_alarm)`,
-      [row.UserId, row.UnitId, row.permission, row.sendSmsAlarm, row.sendEmailAlarm],
-    );
-    keepUserIds.push(row.UserId);
-    keepUnitIds.push(row.UnitId);
-    upserted += res.rowCount;
-  }
+  const payload = rows.map((row) => ({
+    user_id:          row.UserId,
+    unit_id:          row.UnitId,
+    permission:       row.permission,
+    send_sms_alarm:   row.sendSmsAlarm,
+    send_email_alarm: row.sendEmailAlarm,
+  }));
+
+  const upserted = await upsertChunked(pgClient, UPSERT_ASSIGNMENTS, payload);
 
   // 孤儿清理按**自然键**比对（不再按 id —— id 已交给 SERIAL，见 R-007），
   // 且只删来自 SQL Server 的行（不变式 I2）。

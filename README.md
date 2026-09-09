@@ -16,6 +16,7 @@ src/
 ├── initDatabase.js              # 删除并重建 PG 所有表/视图
 ├── derive.js                    # ★ 全部派生规则的唯一实现（迁移与同步共用）
 ├── syncLog.js                   # 同步运行日志（写 sync_runs 表，独立连接）
+├── upserts.js                   # ★ 四张表的批量 UPSERT 语句（jsonb_to_recordset）
 ├── migration-user.js            # 迁移 UserInfomation → users
 ├── migration-company.js         # 迁移 CompanyInfomation → companies
 ├── migration-controller.js      # 迁移 ControllerInfo → controllers
@@ -96,7 +97,13 @@ SELECT max(finished_at) FROM sync_runs WHERE status = 'success';
 **① 全部派生规则只写在 `src/derive.js` 里。** 一次性迁移和定时同步共用同一份
 实现，否则两边一旦漂移，数据会在每轮同步里翻来翻去。
 
-**② 镜像表上没有 `updated_at` 自动时间戳触发器。** 这四张表的 `updated_at` 由源库
+**② 写入一律批量，不要逐行。** 四张表的 UPSERT 在 `src/upserts.js`，用
+`jsonb_to_recordset` 每批 1000 行。原来是 `for (row of rows) await query(...)` ——
+3.2 万次往返，对着 Azure PG（实测单次往返 16.87 ms）单轮要 **9 分钟**，塞不进调度
+周期。改批量后往返降到 36 次。
+⚠️ 本地 Docker 容器往返 0.1 ms 级别，**这类问题排练测不出来**。
+
+**③ 镜像表上没有 `updated_at` 自动时间戳触发器。** 这四张表的 `updated_at` 由源库
 的 `LastUpdateDate` 决定。**应用层对它们的 UPDATE 必须自己写 `updated_at = NOW()`**
 （见 `initDatabase.js` 第 3 节的说明和台账 R-209）。
 
