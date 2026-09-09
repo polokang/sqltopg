@@ -23,7 +23,7 @@ variables:
   # 与 adminpage-api 共用同一个 ACR，可以直接复用那条 service connection
   dockerRegistryServiceConnection: 'b88aab1b-53f7-4728-9628-8db6ffa52604'
   containerRegistry: 'adminpage.azurecr.io'
-  imageRepository: 'aquariustechsqltopg'
+  imageRepository: 'sqltopg'                 # 与 ACR 里已有的仓库同名（adminpage.azurecr.io/sqltopg）
   dockerfilePath: '$(Build.SourcesDirectory)/Dockerfile'
   # 用 git sha 而不是写死的 'test' —— 出问题时能确定线上跑的到底是哪个 commit，
   # 也才有办法回滚（adminpage-api 的 tag 写死成 'test'，回滚时无从下手）
