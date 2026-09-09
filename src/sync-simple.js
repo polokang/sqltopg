@@ -64,6 +64,7 @@ import {
   toBool,
   nullIfBlank,
 } from './derive.js';
+import { getSqlServerConfig, getPostgresUrl } from './dbConfig.js';
 import { startRun, finishRun } from './syncLog.js';
 import {
   upsertChunked,
@@ -78,42 +79,13 @@ dotenv.config();
 // ─── PostgreSQL connection ────────────────────────────────────────────────────
 
 const pgPool = new Pool({
-  connectionString: process.env.POSTGRESQL_URL,
+  connectionString: getPostgresUrl(),
   ssl: { rejectUnauthorized: false },
 });
 
 // ─── SQL Server connection ────────────────────────────────────────────────────
 
-function parseSqlServerUrl(url = '') {
-  const clean = url.replace(/^["']?sqlserver:\/\/["']?/i, '').trim();
-  const cfg = { options: { encrypt: true, trustServerCertificate: true, enableArithAbort: true } };
-
-  const hostMatch = clean.match(/^([^;:]+):?(\d+)?/);
-  if (hostMatch) {
-    cfg.server = hostMatch[1];
-    if (hostMatch[2]) cfg.port = parseInt(hostMatch[2], 10);
-  }
-
-  for (const part of clean.split(';').slice(1)) {
-    const eq = part.indexOf('=');
-    if (eq < 1) continue;
-    const k = part.slice(0, eq).trim().toLowerCase();
-    const v = part.slice(eq + 1).trim();
-    if (k === 'database')                    cfg.database = v;
-    else if (k === 'user')                   cfg.user = v;
-    else if (k === 'password')               cfg.password = v;
-    else if (k === 'trustservercertificate') cfg.options.trustServerCertificate = v === 'true';
-  }
-
-  cfg.pool = { max: 10, min: 0, idleTimeoutMillis: 30000 };
-  return cfg;
-}
-
-const sqlConfig = parseSqlServerUrl(process.env.SQL_SERVER_URL || '');
-
-// 源库名从连接串的 database= 取。**不要硬编码** —— 三段式表名写死库名的话，
-// 改 .env 指向别的库（如 AquariusDev2）根本不生效，而且不会报错。
-const SRC_DB = sqlConfig.database || 'AquariusEmailDB';
+const { cfg: sqlConfig, srcDb: SRC_DB } = getSqlServerConfig();
 
 // ─── companies ────────────────────────────────────────────────────────────────
 

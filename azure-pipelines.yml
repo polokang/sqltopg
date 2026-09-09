@@ -1,0 +1,107 @@
+# sqltopg —— SQL Server → PostgreSQL 同步服务
+#
+# 与 adminpage-api 同一套模式：构建镜像 → 推 ACR → SSH 到 Azure VM → docker run。
+#
+# ⚠️ 凭据一律用 pipeline variables 在运行时 -e 注入，**绝不打进镜像**
+#    （Dockerfile 里那行 COPY .env 已于 2026-09-09 移除）。
+#    下列变量需在 Pipeline → Edit → Variables 里配好，密码类勾选 "Keep this
+#    value secret"：
+#      SQL_SERVER_URL      sqlserver://host:1433;database=AquariusEmailDB;user=…;password=…
+#      POSTGRESQL_URL      postgresql://user:pw@aquariuspgdb.postgres.database.azure.com:5432/AquariusPG
+#
+# ⚠️ 本服务**只能跑单实例**。它每轮做全量 UPSERT + 孤儿清理，两个实例同时跑
+#    会在 DELETE 上互相干扰。所以部署脚本是"先 stop/rm 旧容器再 run"，
+#    不要改成滚动更新或多副本。
+
+trigger:
+  - main
+
+resources:
+  - repo: self
+
+variables:
+  # 与 adminpage-api 共用同一个 ACR，可以直接复用那条 service connection
+  dockerRegistryServiceConnection: 'b88aab1b-53f7-4728-9628-8db6ffa52604'
+  containerRegistry: 'adminpage.azurecr.io'
+  imageRepository: 'aquariustechsqltopg'
+  dockerfilePath: '$(Build.SourcesDirectory)/Dockerfile'
+  # 用 git sha 而不是写死的 'test' —— 出问题时能确定线上跑的到底是哪个 commit，
+  # 也才有办法回滚（adminpage-api 的 tag 写死成 'test'，回滚时无从下手）
+  tag: '$(Build.SourceVersion)'
+  containerName: 'sqltopg_container'
+  # 只绑 127.0.0.1：本服务没有入站业务流量，/health 只给 VM 上的探针用，
+  # 不需要、也不应该暴露到公网
+  healthPort: '8087'
+  vmImageName: 'ubuntu-latest'
+
+stages:
+  - stage: Build
+    displayName: Build and push image
+    jobs:
+      - job: Build
+        pool:
+          vmImage: $(vmImageName)
+        steps:
+          - task: Docker@2
+            displayName: Build and push to ACR
+            inputs:
+              command: buildAndPush
+              repository: $(imageRepository)
+              dockerfile: $(dockerfilePath)
+              containerRegistry: $(dockerRegistryServiceConnection)
+              tags: |
+                $(tag)
+                latest
+
+  - stage: Deploy
+    displayName: Deploy to Azure VM
+    dependsOn: Build
+    condition: succeeded()
+    jobs:
+      - job: Deploy
+        pool:
+          vmImage: $(vmImageName)
+        steps:
+          - task: SSH@0
+            displayName: Pull and restart container on VM
+            inputs:
+              sshEndpoint: 'SSH AquaDev'
+              runOptions: 'commands'
+              commands: |
+                set -e
+                docker pull $(containerRegistry)/$(imageRepository):$(tag)
+                # 单实例：先停旧的再起新的（见文件头的说明）
+                docker stop $(containerName) || true
+                docker rm   $(containerName) || true
+                docker run -d \
+                  --name $(containerName) \
+                  --restart unless-stopped \
+                  -p 127.0.0.1:$(healthPort):3000 \
+                  --log-opt max-size=10m --log-opt max-file=3 \
+                  -e PORT=3000 \
+                  -e SQL_SERVER_URL='$(SQL_SERVER_URL)' \
+                  -e POSTGRESQL_URL='$(POSTGRESQL_URL)' \
+                  -e SYNC_TIMEZONE=Australia/Brisbane \
+                  -e SYNC_AT_HOUR=0 \
+                  -e SYNC_ON_STARTUP=true \
+                  $(containerRegistry)/$(imageRepository):$(tag)
+                # 等健康检查转 healthy 再宣告成功，否则容器起不来也会显示部署通过。
+                #
+                # ⚠️ 这里**不能用 $(...) 做命令替换** —— Azure Pipelines 的变量宏
+                #    也是 $(name) 语法，会在脚本执行前把 $(seq 1 30)、
+                #    $(docker inspect …) 当成未定义变量替换成空串。用反引号，
+                #    并用纯 shell 计数代替 seq。单个 $ 的变量（$i、$s）不受影响。
+                i=0
+                while [ $i -lt 30 ]; do
+                  s=`docker inspect -f '{{.State.Health.Status}}' $(containerName) 2>/dev/null || echo starting`
+                  if [ "$s" = "healthy" ]; then echo "容器已 healthy"; break; fi
+                  i=`expr $i + 1`
+                  if [ $i -eq 30 ]; then
+                    echo "✗ 容器 60 秒内未转 healthy，最近日志："
+                    docker logs --tail 50 $(containerName)
+                    exit 1
+                  fi
+                  sleep 2
+                done
+                # 打印本次启动同步的结果，部署日志里直接能看到通没通
+                docker logs --tail 40 $(containerName)

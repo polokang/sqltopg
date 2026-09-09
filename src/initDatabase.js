@@ -20,6 +20,7 @@
 
 import dotenv from 'dotenv';
 import pg from 'pg';
+import { getPostgresUrl } from './dbConfig.js';
 
 dotenv.config();
 
@@ -27,7 +28,7 @@ const { Client } = pg;
 
 async function initDatabase() {
   const client = new Client({
-    connectionString: process.env.POSTGRESQL_URL,
+    connectionString: getPostgresUrl(),
     ssl: { rejectUnauthorized: false },
   });
   await client.connect();
