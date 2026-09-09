@@ -5,7 +5,7 @@
 项目提供两种用法：
 
 1. **一次性迁移** —— 用 `migration-*.js` 脚本一次性搬完数据（推荐用于首次初始化）。
-2. **定时增量同步** —— `index.js` 启动一个常驻进程，每 2 分钟做一次全量 UPSERT + 孤儿清理，并暴露 HTTP 健康检查。
+2. **定时同步** —— `index.js` 启动一个常驻进程，**每天布里斯班时间 00:00** 做一次全量 UPSERT + 孤儿清理，并暴露 HTTP 健康检查。
 
 ---
 
@@ -15,6 +15,7 @@
 src/
 ├── initDatabase.js              # 删除并重建 PG 所有表/视图
 ├── derive.js                    # ★ 全部派生规则的唯一实现（迁移与同步共用）
+├── syncLog.js                   # 同步运行日志（写 sync_runs 表，独立连接）
 ├── migration-user.js            # 迁移 UserInfomation → users
 ├── migration-company.js         # 迁移 CompanyInfomation → companies
 ├── migration-controller.js      # 迁移 ControllerInfo → controllers
@@ -42,15 +43,58 @@ Dockerfile                       # 运行定时同步服务的镜像
 | `user_mfa_factors` | **无**（Pro 自有） | MFA，不同步 |
 | 视图 `controller_user_permissions` | — | 授权 ⋈ 用户 ⋈ 设备 |
 | 视图 `active_user_controllers` | — | 仅激活用户 × 激活设备 |
+| `sync_runs` | 本项目自己写 | 每次同步一行。**不被 `init-db` 清空** —— 重建镜像表不该丢掉运维历史 |
 
 不由本项目管理的表（adminpage 自有）：`admin_roles` · `admin_permissions` ·
 `admin_role_permissions` · `admin_user_roles` · `firmware_update_logs`。
 它们的 schema 基线在 `adminpage/adminpage-api/prisma/pg/`。
 
+## 调度与运行日志
+
+**每天布里斯班时间 00:00 一次。** 相关环境变量：
+
+```ini
+SYNC_TIMEZONE=Australia/Brisbane   # IANA 时区名
+SYNC_AT_HOUR=0                     # 0 = 午夜
+SYNC_ON_STARTUP=true               # 服务启动时先补一次（默认开，部署完立刻知道通不通）
+```
+
+用 `setTimeout` 递归而不是 `setInterval`：每轮结束后按时区重新计算下一次，
+不会累计漂移。昆士兰不实行夏令时（全年 UTC+10），但代码按 IANA 时区名算，
+换到有夏令时的时区也正确。
+
+想立刻手工跑一次：`npm run sync`（记为 `trigger_source = 'manual'`）。
+
+### `sync_runs` —— 每次同步的记录
+
+```sql
+-- 最近 10 次跑得怎么样
+SELECT id, started_at, status, duration_ms, rows_read, rows_written, rows_deleted, trigger_source
+  FROM sync_runs ORDER BY started_at DESC LIMIT 10;
+
+-- 每张表的明细
+SELECT id, jsonb_pretty(tables) FROM sync_runs ORDER BY id DESC LIMIT 1;
+
+-- 上次成功是什么时候（超过 26 小时就该告警）
+SELECT max(finished_at) FROM sync_runs WHERE status = 'success';
+```
+
+三个设计要点：
+
+1. **日志用独立连接、在同步事务之外提交。** 否则同步失败回滚时会把自己那条失败
+   记录一并回滚 —— 失败就永远不留痕，正好在最需要日志的时候没有日志。
+2. **开始时先插 `status='running'`，结束时更新。** 进程被杀会留下一条永久 `running`
+   的行，那本身就是"这次运行崩了"的信号。服务启动时会把超过 6 小时还是 `running`
+   的行标记为 failed。
+3. **日志写失败绝不让同步失败。** `syncLog.js` 里所有异常都吞掉只打日志。
+
+`/health` 接口也会带上最近 5 次运行 —— 从表里读，比内存计数器可靠（进程重启后
+内存归零，表里的历史还在）。
+
 ### 两个必须知道的约定
 
-**① 全部派生规则只写在 `src/derive.js` 里。** 一次性迁移和 2 分钟同步共用同一份
-实现，否则数据会每 2 分钟翻来翻去。
+**① 全部派生规则只写在 `src/derive.js` 里。** 一次性迁移和定时同步共用同一份
+实现，否则两边一旦漂移，数据会在每轮同步里翻来翻去。
 
 **② 镜像表上没有 `updated_at` 自动时间戳触发器。** 这四张表的 `updated_at` 由源库
 的 `LastUpdateDate` 决定。**应用层对它们的 UPDATE 必须自己写 `updated_at = NOW()`**
@@ -83,7 +127,16 @@ POSTGRESQL_URL=postgresql://<user>:<pw>@<host>:5432/AquariusPG
 
 # 同步服务 HTTP 端口（index.js 使用，可选，默认 3000）
 PORT=3000
+
+# 调度（可选，默认值即下方所示）
+SYNC_TIMEZONE=Australia/Brisbane   # IANA 时区名
+SYNC_AT_HOUR=0                     # 每天几点跑，0 = 午夜
+SYNC_ON_STARTUP=true               # 服务启动时先补跑一次
 ```
+
+> ⚠️ `SQL_SERVER_URL` 里的 `database=` **决定了实际读哪个库** —— 查询用的是
+> 三段式表名 `<database>.dbo.<table>`，库名从这里取。以前是硬编码的
+> `AquariusEmailDB`，改 `.env` 指向别的库根本不生效且不报错，2026-09-09 已修。
 
 ---
 
@@ -130,9 +183,9 @@ npm run dev        # 监听文件变化启动
 npm run sync       # 执行一次 sync 后退出（便于手动触发）
 ```
 
-- 默认每 **2 分钟**执行一次同步（可在 `src/index.js` 里改 `SYNC_INTERVAL_MS`）
+- 每天 **布里斯班时间 00:00** 执行一次（见上文"调度与运行日志"）
 - 同步模型：**全量 UPSERT + 孤儿清理**，每次运行都是幂等的
-- 同步以下四张表：`companies`、`users`、`controllers`、`user_controller_assignments`（按此顺序，外键决定）
+- 每天布里斯班 00:00 同步以下四张表：`companies`、`users`、`controllers`、`user_controller_assignments`（按此顺序，外键决定）
 - 不同步的：`user_identities`、`user_mfa_factors`（Pro 自有），以及 `users.managed_company_ids`（SQL Server 无此字段，由 Pro 人工维护，同步永不覆盖）
 - 全程单事务，出错 `ROLLBACK`
 

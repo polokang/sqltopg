@@ -355,6 +355,47 @@ async function initDatabase() {
          AND c.activated = true;
     `);
 
+    // ── 11. sync_runs —— 同步运行日志 ────────────────────────────────────────
+    //
+    // ⚠️ 用 CREATE TABLE IF NOT EXISTS，且**刻意不在第 2 节的 DROP 列表里**：
+    //    这张表记的是运维历史，不是镜像数据。重建镜像表不该把同步历史一起清掉，
+    //    否则"上次成功同步是什么时候"这个问题在每次 init-db 之后就无从查证了。
+    //
+    // 写入方是 src/syncLog.js，**用独立连接、在同步事务之外提交** —— 否则同步
+    // 失败回滚时会把自己那条失败记录一起回滚掉，等于失败从不留痕。
+    //
+    // 一次运行一行：开始时插入 status='running'，结束时更新为 success / failed。
+    // 进程被杀会留下一条永久 'running' 的行 —— 那本身就是有用的信号
+    // （可以据此发现卡死或崩溃的运行）。
+    console.log('Creating sync_runs (preserved across rebuilds)...');
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS sync_runs (
+        id             BIGSERIAL   PRIMARY KEY,
+        started_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        finished_at    TIMESTAMPTZ,
+        duration_ms    INTEGER,
+        status         VARCHAR(10) NOT NULL DEFAULT 'running'
+                         CHECK (status IN ('running', 'success', 'failed')),
+        trigger_source VARCHAR(20) NOT NULL DEFAULT 'scheduled'
+                         CHECK (trigger_source IN ('scheduled', 'startup', 'manual')),
+        source_db      VARCHAR(64),
+        rows_read      INTEGER,
+        rows_written   INTEGER,
+        rows_deleted   INTEGER,
+        tables         JSONB,
+        error_message  TEXT,
+        host           VARCHAR(128)
+      );
+    `);
+    // 最常见的查询是"最近几次跑得怎么样"
+    await client.query(`CREATE INDEX IF NOT EXISTS sync_runs_started_at_idx ON sync_runs (started_at DESC);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS sync_runs_status_idx     ON sync_runs (status);`);
+
+    await client.query(`COMMENT ON TABLE  sync_runs                IS '每次同步运行一行。由 src/syncLog.js 在同步事务之外写入；init-db 不清空本表'`);
+    await client.query(`COMMENT ON COLUMN sync_runs.tables         IS '每张表的明细：{"users":{"read":5072,"written":0,"deleted":0}, …}'`);
+    await client.query(`COMMENT ON COLUMN sync_runs.trigger_source IS 'scheduled=每日定时 / startup=服务启动时 / manual=手工 npm run sync'`);
+    await client.query(`COMMENT ON COLUMN sync_runs.status         IS 'running 长期不变说明该次运行崩溃或被杀'`);
+
     await client.query('COMMIT');
     console.log('Database initialized successfully.');
   } catch (err) {

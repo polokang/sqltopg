@@ -2,7 +2,7 @@
  * sync-simple.js
  *
  * 常驻增量同步：SQL Server (AquariusEmailDB) → PostgreSQL (AquariusPG)。
- * 由 index.js 每 2 分钟调用一次。
+ * 由 index.js 每天布里斯班时间 00:00 调用一次（2026-09-09 前是每 2 分钟）。
  *
  * 同步的表（snake_case，见 src/initDatabase.js）：
  *   companies                   ← dbo.CompanyInfomation
@@ -64,6 +64,7 @@ import {
   toBool,
   nullIfBlank,
 } from './derive.js';
+import { startRun, finishRun } from './syncLog.js';
 
 dotenv.config();
 
@@ -180,7 +181,11 @@ async function syncCompanies(pgClient, mssqlPool) {
   //    而且删公司会经 controllers.company_id 的 ON DELETE SET NULL 让整批设备失去
   //    归属（也就失去全部 Manager 可见性），代价远大于收益。老站删公司走人工处理。
   console.log(`  实际写入 ${upserted} / ${rows.length} 行（未变化的行不写；companies 不做孤儿清理）`);
-  return { validCompanyIds, pendingManagers };
+  return {
+    validCompanyIds,
+    pendingManagers,
+    stats: { read: rows.length, written: upserted, deleted: 0 },
+  };
 }
 
 /** 在 syncUsers 之后回填 companies.manager_user_id（外键要求 users 先在）。 */
@@ -296,7 +301,10 @@ async function syncUsers(pgClient, mssqlPool) {
     [[...validUserIds]],
   );
   console.log(`  实际写入 ${upserted} / ${rows.length} 行，清理 ${del.rowCount} 条陈旧记录`);
-  return validUserIds;
+  return {
+    validUserIds,
+    stats: { read: rows.length, written: upserted, deleted: del.rowCount },
+  };
 }
 
 // ─── controllers ──────────────────────────────────────────────────────────────
@@ -414,7 +422,13 @@ async function syncControllers(pgClient, mssqlPool, validUserIds, validCompanyId
       ? `（owner 置空 ${nulledOwner}、company 置空 ${nulledCompany}）`
       : ''),
   );
-  return validUnitIds;
+  return {
+    validUnitIds,
+    stats: {
+      read: rows.length, written: upserted, deleted: del.rowCount,
+      nulledOwner, nulledCompany,
+    },
+  };
 }
 
 // ─── user_controller_assignments ──────────────────────────────────────────────
@@ -474,6 +488,12 @@ async function syncAssignments(pgClient, mssqlPool, validUserIds, validUnitIds) 
     [keepUserIds, keepUnitIds],
   );
   console.log(`  实际写入 ${upserted} / ${rows.length} 行，清理 ${del.rowCount} 条陈旧记录`);
+  return {
+    stats: {
+      read: rows.length, written: upserted, deleted: del.rowCount,
+      merged, skippedFk,
+    },
+  };
 }
 
 // ─── Orchestrator ─────────────────────────────────────────────────────────────
@@ -481,16 +501,26 @@ async function syncAssignments(pgClient, mssqlPool, validUserIds, validUnitIds) 
 /**
  * 同步入口，由 index.js 调用。
  *
- * @param {boolean} closePool 同步完关闭 PG 连接池（独立跑本脚本时用；
- *                            index.js 的常驻定时任务不要关）。
+ * 每次运行都会在 PG 的 sync_runs 表里留一条记录（见 src/syncLog.js）。
+ * ⚠️ 日志用**独立连接**写、在本函数的事务之外提交 —— 否则同步失败回滚时会把
+ *    自己那条失败记录一起回滚掉，失败就永远不留痕。
+ *
+ * @param {boolean} closePool     同步完关闭 PG 连接池（独立跑本脚本时用；
+ *                                index.js 的常驻定时任务不要关）。
+ * @param {object}  [opts]
+ * @param {'scheduled'|'startup'|'manual'} [opts.triggerSource] 记进日志的触发来源
  */
-async function syncAllTables(closePool = false) {
+async function syncAllTables(closePool = false, { triggerSource = 'manual' } = {}) {
+  // 先起日志（独立连接），再开事务
+  const runId = await startRun(pgPool, { triggerSource, sourceDb: SRC_DB });
+
   const pgClient = await pgPool.connect();
   let mssqlPool;
+  const tables = {};
 
   try {
     console.log('='.repeat(60));
-    console.log('Sync run starting…');
+    console.log(`Sync run starting… (sync_runs.id=${runId ?? 'n/a'}, trigger=${triggerSource})`);
     console.log('='.repeat(60));
 
     mssqlPool = await sql.connect(sqlConfig);
@@ -503,19 +533,31 @@ async function syncAllTables(closePool = false) {
 
     // 顺序由外键决定：companies → users → controllers → assignments。
     // companies.manager_user_id 反过来依赖 users，所以拆成两步，回填放最后。
-    const { validCompanyIds, pendingManagers } = await syncCompanies(pgClient, mssqlPool);
-    const validUserIds = await syncUsers(pgClient, mssqlPool);
-    const validUnitIds = await syncControllers(pgClient, mssqlPool, validUserIds, validCompanyIds);
-    await syncAssignments(pgClient, mssqlPool, validUserIds, validUnitIds);
-    await backfillCompanyManagers(pgClient, pendingManagers, validUserIds);
+    const co = await syncCompanies(pgClient, mssqlPool);
+    tables.companies = co.stats;
+
+    const us = await syncUsers(pgClient, mssqlPool);
+    tables.users = us.stats;
+
+    const ct = await syncControllers(pgClient, mssqlPool, us.validUserIds, co.validCompanyIds);
+    tables.controllers = ct.stats;
+
+    const as = await syncAssignments(pgClient, mssqlPool, us.validUserIds, ct.validUnitIds);
+    tables.user_controller_assignments = as.stats;
+
+    await backfillCompanyManagers(pgClient, co.pendingManagers, us.validUserIds);
 
     await pgClient.query('COMMIT');
+
+    await finishRun(pgPool, runId, { status: 'success', tables });
 
     console.log('\n' + '='.repeat(60));
     console.log('✓ Sync run completed');
     console.log('='.repeat(60));
   } catch (err) {
     await pgClient.query('ROLLBACK').catch(() => {});
+    // 事务已回滚，日志走独立连接，所以这条失败记录能留下来
+    await finishRun(pgPool, runId, { status: 'failed', tables, error: err });
     console.error('\n✗ Sync run failed — rolled back:', err.message);
     console.error(err.stack);
     throw err;
@@ -527,6 +569,7 @@ async function syncAllTables(closePool = false) {
 }
 
 export { syncAllTables };
+export { pgPool };
 
 // ─── Standalone entry ─────────────────────────────────────────────────────────
 
@@ -534,5 +577,5 @@ const __filename = fileURLToPath(import.meta.url);
 const isMainModule = process.argv[1] && resolve(process.argv[1]) === resolve(__filename);
 
 if (isMainModule) {
-  syncAllTables(true).catch(() => process.exit(1));
+  syncAllTables(true, { triggerSource: 'manual' }).catch(() => process.exit(1));
 }
