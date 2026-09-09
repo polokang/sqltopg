@@ -2,12 +2,19 @@
 #
 # 与 adminpage-api 同一套模式：构建镜像 → 推 ACR → SSH 到 Azure VM → docker run。
 #
-# ⚠️ 凭据一律用 pipeline variables 在运行时 -e 注入，**绝不打进镜像**
-#    （Dockerfile 里那行 COPY .env 已于 2026-09-09 移除）。
-#    下列变量需在 Pipeline → Edit → Variables 里配好，密码类勾选 "Keep this
-#    value secret"：
-#      SQL_SERVER_URL      sqlserver://host:1433;database=AquariusEmailDB;user=…;password=…
-#      POSTGRESQL_URL      postgresql://user:pw@aquariuspgdb.postgres.database.azure.com:5432/AquariusPG
+# ⚠️ 凭据**绝不打进镜像**（Dockerfile 里那行 COPY .env 已于 2026-09-09 移除），
+#    而是由服务器上的一个文件提供，运行时用 --env-file 读：
+#
+#        /home/aquacentosadmin/sqltopg/.env
+#
+#    该文件由人工维护，只放两个连接串，权限 600。流水线因此**不需要**持有任何
+#    凭据 —— 换口令只改服务器上那一个文件，不用动 pipeline 变量。
+#
+#    ⚠️ 该文件必须是 **LF 行尾、值不带引号**。Docker 的 --env-file 与 dotenv 不同：
+#       它不剥引号、也不处理 CRLF，`"…"` 以及行尾的 CR 都会变成值的一部分。
+#       末位参数 trustServerCertificate 被污染后表现为
+#       "self-signed certificate" 连接失败 —— 错误信息完全指不到真正原因。
+#       （v2.0 的 src/dbConfig.js 会兜住并告警，但不要依赖它。）
 #
 # ⚠️ 本服务**只能跑单实例**。它每轮做全量 UPSERT + 孤儿清理，两个实例同时跑
 #    会在 DELETE 上互相干扰。所以部署脚本是"先 stop/rm 旧容器再 run"，
@@ -32,6 +39,8 @@ variables:
   # 只绑 127.0.0.1：本服务没有入站业务流量，/health 只给 VM 上的探针用，
   # 不需要、也不应该暴露到公网
   healthPort: '8087'
+  # 服务器上存放凭据的文件，人工维护（见文件头说明）
+  envFile: '/home/aquacentosadmin/sqltopg/.env'
   vmImageName: 'ubuntu-latest'
 
 stages:
@@ -73,14 +82,16 @@ stages:
                 # 单实例：先停旧的再起新的（见文件头的说明）
                 docker stop $(containerName) || true
                 docker rm   $(containerName) || true
+                # 凭据文件必须在位。少了它容器照样能起来、HTTP 服务和健康检查都正常，
+                # 只是同步一直失败 —— 所以在这里硬性拦一道，别让部署"看起来成功"。
+                test -f $(envFile) || { echo "✗ 缺少凭据文件 $(envFile)"; exit 1; }
                 docker run -d \
                   --name $(containerName) \
                   --restart unless-stopped \
                   -p 127.0.0.1:$(healthPort):3000 \
                   --log-opt max-size=10m --log-opt max-file=3 \
+                  --env-file $(envFile) \
                   -e PORT=3000 \
-                  -e SQL_SERVER_URL='$(SQL_SERVER_URL)' \
-                  -e POSTGRESQL_URL='$(POSTGRESQL_URL)' \
                   -e SYNC_TIMEZONE=Australia/Brisbane \
                   -e SYNC_AT_HOUR=0 \
                   -e SYNC_ON_STARTUP=true \
