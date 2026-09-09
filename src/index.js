@@ -29,9 +29,11 @@ async function performSync() {
   
   try {
     console.log(`\n[${new Date().toISOString()}] 开始执行同步任务...`);
-    // 首次同步时重建数据库结构，后续同步不重建
-    const isFirstSync = syncStatus.syncCount === 0;
-    await syncAllTables(false, false, isFirstSync);
+    // 常驻服务**永远不重建 schema**。建表只由 src/initDatabase.js 负责，而它是
+    // "删库重建"，绝不能挂在定时任务上。
+    // （这里原先传过一个 isFirstSync 并注释成"首次同步时重建数据库结构"，实际被
+    //   syncAllTables 忽略 —— 留着这种注释迟早有人照着实现，已删。）
+    await syncAllTables(false);
     syncStatus.syncCount++;
     syncStatus.lastSyncError = null;
     console.log(`[${new Date().toISOString()}] ✓ 同步任务完成`);

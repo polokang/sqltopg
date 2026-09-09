@@ -14,10 +14,11 @@
 ```
 src/
 ├── initDatabase.js              # 删除并重建 PG 所有表/视图
-├── migration-user.js            # 迁移 UserInfomation → "UserInfo"
-├── migration-company.js         # 迁移 UserInfomation → "CompanyInfo"
-├── migration-controller.js      # 迁移 ControllerInfo → "ControllerInfo"
-├── migration-assignment.js      # 迁移 UserControllerAssignment → "UserControllerAssignment"
+├── derive.js                    # ★ 全部派生规则的唯一实现（迁移与同步共用）
+├── migration-user.js            # 迁移 UserInfomation → users
+├── migration-company.js         # 迁移 CompanyInfomation → companies
+├── migration-controller.js      # 迁移 ControllerInfo → controllers
+├── migration-assignment.js      # 迁移 UserControllerAssignment → user_controller_assignments
 ├── progress.js                  # 进度条输出工具
 ├── sync-simple.js               # 常驻同步逻辑（UPSERT + 孤儿清理）
 └── index.js                     # 定时任务 + 健康检查服务入口
@@ -26,19 +27,34 @@ Dockerfile                       # 运行定时同步服务的镜像
 
 ---
 
-## 目标 Schema（PostgreSQL，全部 PascalCase）
+## 目标 Schema（PostgreSQL，全部 lower_snake_case）
 
-| 表 / 视图                    | 说明                                                           |
-| ---------------------------- | -------------------------------------------------------------- |
-| `"UserInfo"`                 | 用户信息（合并了老 schema 中的 `users` + `user_profiles`）     |
-| `"CompanyInfo"`              | 公司信息                                                       |
-| `"UserIdentity"`             | 第三方身份认证绑定（Google/GitHub 等）                         |
-| `"UserMfaFactor"`            | 多因子认证因子（TOTP/SMS/...）                                 |
-| `"ControllerInfo"`           | 控制器设备信息                                                 |
-| `"UserControllerAssignment"` | 用户-控制器权限关系                                            |
-| 视图 `"UserFullInfo"`        | UserInfo 的只读投影                                            |
-| 视图 `"ControllerUserPermissions"` | 权限关系 + 用户 + 控制器联合视图                         |
-| 视图 `"UserControllers"`     | 激活用户可访问的激活控制器                                     |
+命名规范见 `Aquareporter-pro/docs/migration/05-pg-naming-convention.md`。
+建表脚本 `src/initDatabase.js` 是唯一权威。
+
+| 表 / 视图 | 数据源 | 说明 |
+|---|---|---|
+| `users` | `dbo.UserInfomation` | 用户。`roles` 由 `UserTypeId` 派生；`jw_code` ← `JWCode` |
+| `companies` | `dbo.CompanyInfomation` | 公司（185 家，用真名）。**没有 `jw_code`** |
+| `controllers` | `dbo.ControllerInfo` | 设备。`company_id` 取**设备自己的**公司 |
+| `user_controller_assignments` | `dbo.UserControllerAssignment` | 授权。按 `(user_id, unit_id)` 自然键 |
+| `user_identities` | **无**（Pro 自有） | Passkey / Google 绑定，不同步 |
+| `user_mfa_factors` | **无**（Pro 自有） | MFA，不同步 |
+| 视图 `controller_user_permissions` | — | 授权 ⋈ 用户 ⋈ 设备 |
+| 视图 `active_user_controllers` | — | 仅激活用户 × 激活设备 |
+
+不由本项目管理的表（adminpage 自有）：`admin_roles` · `admin_permissions` ·
+`admin_role_permissions` · `admin_user_roles` · `firmware_update_logs`。
+它们的 schema 基线在 `adminpage/adminpage-api/prisma/pg/`。
+
+### 两个必须知道的约定
+
+**① 全部派生规则只写在 `src/derive.js` 里。** 一次性迁移和 2 分钟同步共用同一份
+实现，否则数据会每 2 分钟翻来翻去。
+
+**② 镜像表上没有 `updated_at` 自动时间戳触发器。** 这四张表的 `updated_at` 由源库
+的 `LastUpdateDate` 决定。**应用层对它们的 UPDATE 必须自己写 `updated_at = NOW()`**
+（见 `initDatabase.js` 第 3 节的说明和台账 R-209）。
 
 ### `Permission` 字段（SMALLINT）
 
@@ -116,8 +132,8 @@ npm run sync       # 执行一次 sync 后退出（便于手动触发）
 
 - 默认每 **2 分钟**执行一次同步（可在 `src/index.js` 里改 `SYNC_INTERVAL_MS`）
 - 同步模型：**全量 UPSERT + 孤儿清理**，每次运行都是幂等的
-- 同步以下三张表：`"UserInfo"`、`"ControllerInfo"`、`"UserControllerAssignment"`
-- 不同步的表：`"CompanyInfo"`（由 migration 脚本一次性迁移，后续应由应用侧维护）、`"UserIdentity"`、`"UserMfaFactor"`（应用侧数据，不受源库影响）
+- 同步以下四张表：`companies`、`users`、`controllers`、`user_controller_assignments`（按此顺序，外键决定）
+- 不同步的：`user_identities`、`user_mfa_factors`（Pro 自有），以及 `users.managed_company_ids`（SQL Server 无此字段，由 Pro 人工维护，同步永不覆盖）
 - 全程单事务，出错 `ROLLBACK`
 
 ### 健康检查
@@ -173,7 +189,7 @@ Node.js **18+**。
 
 ## 常见问题排查
 
-- **`relation "UserInfo" does not exist`** —— 目标库还没初始化，先跑一次 `npm run init-db` 或 `npm run migrate`。
+- **`relation "users" does not exist`** —— 目标库还没初始化，先跑一次 `npm run init-db` 或 `npm run migrate`。
 - **`null value in column "Name"`** —— SQL Server 里对应记录 `UserName`、`Name`、`Email` 全为 NULL；按设计这种行会被丢弃，请检查源数据。
 - **FK 约束报错（`CompanyId_fkey` / `OwnerId_fkey` / ...）** —— 通常是源数据有孤立引用。migration 脚本会先诊断并打印出所有孤儿行，再决定是否恢复约束；`sync-simple.js` 在运行时直接把找不到对应父行的 FK 值置 NULL（或跳过整行）。
 - **同步服务启动就报错退出** —— 先用 `npm run sync` 在前台跑一次，观察完整堆栈。

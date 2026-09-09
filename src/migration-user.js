@@ -1,39 +1,68 @@
 /**
  * migration-user.js
  *
- * Migrate UserInfo: SQL Server (AquariusEmailDB) → PostgreSQL (AquariusPG)
+ * Migrate users: SQL Server (AquariusEmailDB) → PostgreSQL (AquariusPG)
  *
- * Source : AquariusEmailDB.dbo.UserInfomation (all rows)
- * Target : PostgreSQL public."UserInfo"
+ * Source : dbo.UserInfomation  (WHERE Email IS NOT NULL)
+ * Target : PostgreSQL public.users
+ *
+ * 命名规范：Aquareporter-pro/docs/migration/05-pg-naming-convention.md
+ * 目标 schema：src/initDatabase.js　**派生规则全部来自 src/derive.js**
  *
  * Column mapping:
- *   UserId               → "UserId"
- *   CompanyId            → "CompanyId"
- *   Email                → "Email"
- *   Activated=1          → "EmailVerified" = true, else false
- *   Mobile               → "Mobile"
- *   IsPhoneVerified      → "MobileVerified"
- *   UserName             → "Name"
- *   PasswordHash         → "PasswordHash"
- *   Logo                 → "Avatar"
- *   Roles (derived):
- *     UserTypeId = 22    → ['super']
- *     Production = 1     → ['manager'],  ManagedCompanyIds = [CompanyId]
- *     otherwise          → ['operator'], ManagedCompanyIds = []
- *   Activated            → "Activated"
- *   RequiresTwoFactorAuth → "MfaEnabled"
- *   LastLoginTime        → "LastLoginTime"
- *   DateCreated          → "CreatedAt"
- *   LastUpdateDate       → "UpdatedAt"
+ *   UserId                → user_id
+ *   CompanyId             → company_id           原值（挂在 3001 也无所谓，见下）
+ *   Email                 → email
+ *   Activated=1           → email_verified
+ *   Mobile                → mobile               空则 '0000000000'
+ *   IsPhoneVerified       → mobile_verified
+ *   UserName→Name→Email   → name
+ *   PasswordHash          → password_hash
+ *   Logo                  → avatar_url
+ *   JWCode                → jw_code         🆕
+ *   UserTypeId            → roles                见 derive.deriveRoles
+ *   UserTypeId+CompanyId  → managed_company_ids  见 derive.deriveManagedCompanyIds
+ *   Activated             → activated
+ *   RequiresTwoFactorAuth → mfa_enabled
+ *   LastLoginTime         → last_login_at
+ *   DateCreated           → created_at
+ *   LastUpdateDate        → updated_at           源列可空，空则回退 DateCreated
+ *   —                     → sync_source          建表 DEFAULT 'mssql'
+ *
+ * ⚠️ 2026-09-09 按 David Grevell 的权限模型邮件重写，三处变化：
+ *
+ * ① **roles 改由 UserTypeId 派生，不再读 Production，也不再有 'owner'。**
+ *    旧规则 `Production=1 → ['manager','owner']` 把 243 个 Owner 全变成 Manager，
+ *    导致挂在同一 CompanyId 下的客户互相可见（3001 一家 71 个客户、1373 台设备）。
+ *    Owner 是 per-controller 关系，运行时按 controllers.owner_user_id 判定。
+ *
+ * ② **加 jw_code。** 邮件："Jiwa Code should be linked to Owner -> so maybe in
+ *    userinfomation. Companies don't need a jiwa code."
+ *
+ * ③ **company_id 保持源库原值。** 它的唯一用途是"Manager 能管哪些用户"
+ *    （managedCompanyIds[] ↔ UserInfo.companyId）。个人客户挂在 3001 无害 ——
+ *    只要 roles 不再把他们当 Manager。
+ *
+ * ⚠️ 重复邮箱**去重而不中止**（与 sync-simple.js 行为一致）。同步是无人值守跑的，
+ *    中止会让整个同步停摆；两边必须用同一套去重逻辑，否则幂等性无从保证。
  *
  * Run:
- *   node src/migration-user.js
+ *   node src/migration-user.js        ← 必须先于 migration-company.js
  */
 
 import dotenv from 'dotenv';
 import { Pool } from 'pg';
 import sql from 'mssql';
 import { startProgress } from './progress.js';
+import {
+  deriveRoles,
+  deriveManagedCompanyIds,
+  deriveJwCode,
+  deriveUserName,
+  deriveMobile,
+  dedupeUsersByEmail,
+  toBool,
+} from './derive.js';
 
 dotenv.config();
 
@@ -72,41 +101,11 @@ function parseSqlServerUrl(url = '') {
 }
 
 const sqlConfig = parseSqlServerUrl(process.env.SQL_SERVER_URL);
-
-// ─── Role derivation ──────────────────────────────────────────────────────────
-
-function deriveRolesAndCompanies(row) {
-  // UserTypeId=22 → super, takes absolute priority over everything else
-  if (row.UserTypeId === 22) {
-    return { roles: ['super'], managedCompanyIds: [] };
-  }
-
-  const roles = [];
-  let managedCompanyIds = [];
-
-  // Production=1 → manager + owner, manages own CompanyId
-  if (row.Production === 1 || row.Production === true) {
-    roles.push('manager', 'owner');
-    managedCompanyIds = [row.CompanyId];
-  }
-
-  // UserTypeId=24 → at least manager + manages own CompanyId
-  if (row.UserTypeId === 24 && !roles.includes('manager')) {
-    roles.push('manager');
-    managedCompanyIds = [row.CompanyId];
-  }
-
-  // Default fallback
-  if (roles.length === 0) {
-    roles.push('operator');
-  }
-
-  return { roles, managedCompanyIds };
-}
+const SRC_DB = sqlConfig.database || 'AquariusEmailDB';
 
 // ─── Migration ────────────────────────────────────────────────────────────────
 
-async function migrateUserInfo(pgClient) {
+async function migrateUsers(pgClient) {
   console.log('Connecting to SQL Server…');
   const sqlPool = await sql.connect(sqlConfig);
   console.log(`✓ Connected: ${sqlConfig.server}/${sqlConfig.database}`);
@@ -115,6 +114,7 @@ async function migrateUserInfo(pgClient) {
     SELECT
       UserId,
       CompanyId,
+      UserTypeId,
       Email,
       Mobile,
       IsPhoneVerified,
@@ -122,20 +122,32 @@ async function migrateUserInfo(pgClient) {
       Name,
       PasswordHash,
       Logo,
-      UserTypeId,
-      Production,
+      JWCode,
       Activated,
       RequiresTwoFactorAuth,
       LastLoginTime,
       DateCreated,
-      LastUpdateDate
-    FROM AquariusEmailDB.dbo.UserInfomation
+      COALESCE(LastUpdateDate, DateCreated) AS LastUpdateDate
+    FROM ${SRC_DB}.dbo.UserInfomation
     WHERE Email IS NOT NULL
   `);
 
-  const rows = result.recordset;
-  console.log(`✓ Read ${rows.length} rows from UserInfomation`);
+  const sourceRows = result.recordset;
   await sqlPool.close();
+
+  const { rows, dropped } = dedupeUsersByEmail(sourceRows);
+  console.log(`✓ Read ${sourceRows.length} source rows → ${rows.length} after email dedup`);
+
+  if (dropped.length > 0) {
+    console.warn(`\n⚠ ${dropped.length} 组重复邮箱（忽略大小写），已按"Activated > CorporateManager > 较大 UserId"取一：`);
+    console.warn('  email                                    保留    丢弃');
+    console.warn('  ' + '-'.repeat(60));
+    for (const d of dropped.slice(0, 30)) {
+      console.warn(`  ${d.email.padEnd(40)} ${String(d.keptUserId).padEnd(7)} ${d.droppedUserId}`);
+    }
+    if (dropped.length > 30) console.warn(`  …还有 ${dropped.length - 30} 组`);
+    console.warn('  这些账号建议在 SQL Server 上合并或停用 —— 被丢弃的一方在 Pro 里无法登录。\n');
+  }
 
   if (rows.length === 0) {
     console.log('⚠ No rows to migrate.');
@@ -143,48 +155,53 @@ async function migrateUserInfo(pgClient) {
   }
 
   let inserted = 0;
-  const progress = startProgress(rows.length, 'UserInfo     ');
+  const roleTally = new Map();
+  const progress = startProgress(rows.length, 'users        ');
 
   for (const row of rows) {
-    const { roles, managedCompanyIds } = deriveRolesAndCompanies(row);
+    const roles = deriveRoles(row.UserTypeId);
+    const managedCompanyIds = deriveManagedCompanyIds(row.UserTypeId, row.CompanyId);
+    roleTally.set(roles.join('+'), (roleTally.get(roles.join('+')) ?? 0) + 1);
 
     await pgClient.query(
-      `INSERT INTO "UserInfo" (
-         "UserId",
-         "CompanyId",
-         "Email",
-         "EmailVerified",
-         "Mobile",
-         "MobileVerified",
-         "Name",
-         "PasswordHash",
-         "Avatar",
-         "Roles",
-         "ManagedCompanyIds",
-         "Activated",
-         "MfaEnabled",
-         "LastLoginTime",
-         "CreatedAt",
-         "UpdatedAt"
+      `INSERT INTO users (
+         user_id,
+         company_id,
+         email,
+         email_verified,
+         mobile,
+         mobile_verified,
+         name,
+         password_hash,
+         avatar_url,
+         jw_code,
+         roles,
+         managed_company_ids,
+         activated,
+         mfa_enabled,
+         last_login_at,
+         created_at,
+         updated_at
        )
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
       [
         row.UserId,
         row.CompanyId,
         row.Email,
-        row.Activated === 1 || row.Activated === true,                          // EmailVerified
-        row.Mobile || '0000000000',
-        row.IsPhoneVerified === 1 || row.IsPhoneVerified === true,              // MobileVerified
-        row.UserName || row.Name || row.Email,                                   // Name: UserName → Name → Email
+        toBool(row.Activated),                    // email_verified
+        deriveMobile(row.Mobile),
+        toBool(row.IsPhoneVerified),              // mobile_verified
+        deriveUserName(row),                      // name
         row.PasswordHash || '',
-        row.Logo || null,                                                        // Avatar
+        row.Logo || null,                         // avatar_url
+        deriveJwCode(row.JWCode),                 // jw_code
         roles,
         managedCompanyIds,
-        row.Activated === 1 || row.Activated === true,                          // Activated
-        row.RequiresTwoFactorAuth === 1 || row.RequiresTwoFactorAuth === true,  // MfaEnabled
-        row.LastLoginTime || null,
-        row.DateCreated,
-        row.LastUpdateDate,
+        toBool(row.Activated),
+        toBool(row.RequiresTwoFactorAuth),        // mfa_enabled
+        row.LastLoginTime || null,                // last_login_at
+        row.DateCreated,                          // created_at
+        row.LastUpdateDate,                       // updated_at（SELECT 里已 COALESCE）
       ],
     );
     inserted++;
@@ -193,25 +210,7 @@ async function migrateUserInfo(pgClient) {
   progress.done();
 
   console.log(`✓ Inserted : ${inserted}`);
-}
-
-// ─── Restore CompanyInfo.ManagerId FK (if not yet restored) ──────────────────
-
-async function restoreCompanyManagerFk(pgClient) {
-  // The FK was dropped in migration-company.js to allow inserting raw UserId
-  // values before UserInfo existed. Now that UserInfo is populated, restore it.
-  await pgClient.query(`
-    ALTER TABLE "CompanyInfo"
-      DROP CONSTRAINT IF EXISTS "CompanyInfo_ManagerId_fkey";
-  `);
-  await pgClient.query(`
-    ALTER TABLE "CompanyInfo"
-      ADD CONSTRAINT "CompanyInfo_ManagerId_fkey"
-        FOREIGN KEY ("ManagerId")
-        REFERENCES "UserInfo" ("UserId")
-        ON DELETE CASCADE;
-  `);
-  console.log('✓ Restored CompanyInfo_ManagerId_fkey → UserInfo("UserId")');
+  console.log('  角色分布：' + [...roleTally.entries()].map(([r, n]) => `${r}=${n}`).join('  '));
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
@@ -221,18 +220,11 @@ async function run() {
 
   try {
     await pgClient.query('BEGIN');
-    await migrateUserInfo(pgClient);
+    await migrateUsers(pgClient);
     await pgClient.query('COMMIT');
 
-    // Restore the FK that migration-company.js temporarily dropped
-    await restoreCompanyManagerFk(pgClient);
-
     console.log('\n✓ migration-user completed.');
-    console.log('Next: verify ManagerId references with:');
-    console.log('  SELECT c."CompanyId", c."ManagerId"');
-    console.log('  FROM "CompanyInfo" c');
-    console.log('  LEFT JOIN "UserInfo" u ON c."ManagerId" = u."UserId"');
-    console.log('  WHERE c."ManagerId" IS NOT NULL AND u."UserId" IS NULL;');
+    console.log('Next: node src/migration-company.js  （它会顺带恢复 companies 的外键）');
   } catch (err) {
     await pgClient.query('ROLLBACK').catch(() => {});
     console.error('\n✗ Migration failed — rolled back:', err.message);
