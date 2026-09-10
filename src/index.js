@@ -7,25 +7,72 @@ dotenv.config();
 
 const PORT = process.env.PORT || 3000;
 
-// ─── 调度：每天布里斯班时间 00:00 ─────────────────────────────────────────────
+// ─── 调度 ─────────────────────────────────────────────────────────────────────
 //
-// 2026-09-09 从"每 2 分钟一次"改成"每天一次"。
+// 两种模式，由 SYNC_INTERVAL_MINUTES 决定：
 //
-// ⚠️ 由此带来的后果必须清楚：老站 / adminpage 改的数据，Pro 侧最长要 24 小时
-//    才能看到。双写期靠"2 分钟同步自愈"的那些设计（docs/migration/04、06 的
-//    不变式 I2）现在自愈窗口变成一天 —— sync_source='pro' 的保护因此更关键。
-//    Pro 正式上线前需要重新评估这个间隔。
+//   SYNC_INTERVAL_MINUTES = 0   → **每天定时**：在 SYNC_TIMEZONE 的
+//                                 SYNC_AT_HOUR:00 跑一次
+//   SYNC_INTERVAL_MINUTES > 0   → **按间隔**：每 N 分钟跑一次，
+//                                 SYNC_AT_HOUR / SYNC_TIMEZONE 不再参与调度
 //
-// Australia/Brisbane 全年 UTC+10（昆士兰不实行夏令时），所以不存在"某天 23 小时
-// 或 25 小时"的问题。这里仍按 IANA 时区名计算而不是写死 +10，万一将来昆州改了
-// 政策也不用动代码。
+// ⚠️ 间隔模式有 5 分钟下限。低于下限会被提升到 5 并告警 —— 不是拍脑袋定的：
+//    2026-09-09 实测（本机 → Azure PG）单轮约 2 秒（1.5 秒读源库 + 批量写），
+//    5 分钟留了两个数量级的余量。真要更密，先把单轮耗时测出来再说。
+//    另外 performSync() 有 isRunning 保护，上一轮没跑完不会重入。
+//
+// ⚠️ 间隔模式改变了双写的自愈窗口。docs/migration/04、06 的不变式 I2
+//    （"mirror 失败只记日志，靠同步自愈"）里，自愈延迟 = 本间隔。
+//    每天一次 = 最长 24 小时；设成 5~15 分钟就回到接近原先的水平。
+//    见台账 R-213。
+//
+// Australia/Brisbane 全年 UTC+10（昆士兰不实行夏令时），所以每天定时模式不存在
+// "某天 23 小时或 25 小时"的问题。这里仍按 IANA 时区名计算而不是写死 +10，
+// 万一将来昆州改了政策也不用动代码。
 const SYNC_TIMEZONE = process.env.SYNC_TIMEZONE || 'Australia/Brisbane';
 const SYNC_AT_HOUR = Number(process.env.SYNC_AT_HOUR ?? 0); // 0 = 午夜
-// 启动时是否立刻补一次（默认是：部署完不用等到半夜才知道能不能跑通）
+// 启动时是否立刻补一次（默认是：部署完不用等到下一个周期才知道能不能跑通）
 const SYNC_ON_STARTUP = process.env.SYNC_ON_STARTUP !== 'false';
 
-/** 返回距离目标时区下一个 SYNC_AT_HOUR:00:00 的毫秒数。 */
+/** 间隔模式的下限（分钟）。 */
+const MIN_INTERVAL_MINUTES = 5;
+
+/**
+ * 解析 SYNC_INTERVAL_MINUTES，决定调度模式。
+ * 非法值一律退回"每天定时"并告警 —— 静默按某个默认值跑，比报错更难查。
+ */
+function resolveSchedule() {
+  const raw = String(process.env.SYNC_INTERVAL_MINUTES ?? '').trim();
+  if (raw === '') return { mode: 'daily' };
+
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0) {
+    console.warn(
+      `⚠ SYNC_INTERVAL_MINUTES="${raw}" 不是有效的非负数字，` +
+      `按 0 处理（改为每天 ${SYNC_AT_HOUR}:00 ${SYNC_TIMEZONE} 定时同步）。`,
+    );
+    return { mode: 'daily' };
+  }
+  if (n === 0) return { mode: 'daily' };
+
+  if (n < MIN_INTERVAL_MINUTES) {
+    console.warn(
+      `⚠ SYNC_INTERVAL_MINUTES=${n} 低于下限 ${MIN_INTERVAL_MINUTES} 分钟，已提升为 ` +
+      `${MIN_INTERVAL_MINUTES} 分钟。要跑得更密，先实测单轮耗时（看 sync_runs.duration_ms）。`,
+    );
+    return { mode: 'interval', minutes: MIN_INTERVAL_MINUTES };
+  }
+  return { mode: 'interval', minutes: n };
+}
+
+const SCHEDULE = resolveSchedule();
+
+/** 距离下一次同步的毫秒数。两种模式共用这一个入口。 */
 function msUntilNextRun(now = new Date()) {
+  if (SCHEDULE.mode === 'interval') {
+    return SCHEDULE.minutes * 60 * 1000;
+  }
+
   const parts = new Intl.DateTimeFormat('en-GB', {
     timeZone: SYNC_TIMEZONE,
     hour: '2-digit',
@@ -47,6 +94,13 @@ function msUntilNextRun(now = new Date()) {
   let wait = targetMs - nowMs;
   if (wait <= 0) wait += 24 * 3600 * 1000; // 今天这个点已过，等明天
   return wait;
+}
+
+/** 一句话描述当前调度，日志与 /health 共用。 */
+function describeSchedule() {
+  return SCHEDULE.mode === 'interval'
+    ? `每 ${SCHEDULE.minutes} 分钟一次`
+    : `每天 ${String(SYNC_AT_HOUR).padStart(2, '0')}:00 (${SYNC_TIMEZONE})`;
 }
 
 /** 用目标时区把时间格式化出来，日志里好读。 */
@@ -117,8 +171,11 @@ function createHealthCheckServer() {
         service: 'sql-to-pg-sync',
         timestamp: new Date().toISOString(),
         schedule: {
-          timezone: SYNC_TIMEZONE,
-          atHour: SYNC_AT_HOUR,
+          mode: SCHEDULE.mode,                       // 'interval' | 'daily'
+          intervalMinutes: SCHEDULE.minutes ?? null, // 仅 interval 模式有值
+          timezone: SYNC_TIMEZONE,                   // 仅 daily 模式参与调度
+          atHour: SYNC_AT_HOUR,                      // 仅 daily 模式参与调度
+          description: describeSchedule(),
           nextRunAt: new Date(Date.now() + msUntilNextRun()).toISOString(),
         },
         sync: {
@@ -151,11 +208,10 @@ function createHealthCheckServer() {
  * 启动定时同步任务
  */
 async function startScheduledSync() {
-  const pad = (n) => String(n).padStart(2, '0');
   console.log('='.repeat(60));
   console.log('SQL Server 到 PostgreSQL 定时同步服务');
   console.log('='.repeat(60));
-  console.log(`同步时刻: 每天 ${pad(SYNC_AT_HOUR)}:00 (${SYNC_TIMEZONE})`);
+  console.log(`同步调度: ${describeSchedule()}`);
   console.log(`当前时间: ${fmtInTz(new Date())} (${SYNC_TIMEZONE})`);
   console.log(`健康检查端口: ${PORT}`);
   console.log('='.repeat(60));
@@ -171,15 +227,17 @@ async function startScheduledSync() {
     console.log('\nSYNC_ON_STARTUP=false，跳过启动时同步');
   }
 
-  // 用 setTimeout 递归而不是 setInterval：每次跑完重新按时区算下一次，
-  // 这样不会因为累计漂移或夏令时（本时区没有，但别的时区会）而偏离目标时刻。
+  // 用 setTimeout 递归而不是 setInterval，两种模式都受益：
+  //   每天定时 —— 每轮跑完重新按时区算下一次，不会累计漂移，夏令时也正确
+  //   按间隔   —— 间隔从"上一轮结束"起算，保证两轮之间真有这么长的空档，
+  //               不会出现上一轮还没跑完下一轮就排上的情况
   const scheduleNext = () => {
     const wait = msUntilNextRun();
     const at = new Date(Date.now() + wait);
-    console.log(
-      `\n✓ 下次同步: ${fmtInTz(at)} (${SYNC_TIMEZONE})，` +
-      `${(wait / 3600000).toFixed(1)} 小时后`,
-    );
+    const rel = wait >= 3600000
+      ? `${(wait / 3600000).toFixed(1)} 小时后`
+      : `${Math.round(wait / 60000)} 分钟后`;
+    console.log(`\n✓ 下次同步: ${fmtInTz(at)} (${SYNC_TIMEZONE})，${rel}`);
     setTimeout(async () => {
       await performSync('scheduled');
       scheduleNext();

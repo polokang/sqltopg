@@ -33,9 +33,6 @@ variables:
   containerRegistry: 'adminpage.azurecr.io'
   imageRepository: 'sqltopg'                 # 与 ACR 里已有的仓库同名（adminpage.azurecr.io/sqltopg）
   dockerfilePath: '$(Build.SourcesDirectory)/Dockerfile'
-  # 用 git sha 而不是写死的 'test' —— 出问题时能确定线上跑的到底是哪个 commit，
-  # 也才有办法回滚（adminpage-api 的 tag 写死成 'test'，回滚时无从下手）
-  tag: '$(Build.SourceVersion)'
   # 必须与 docker-compose.yml 里的 container_name 一致，否则健康等待查不到容器
   containerName: 'sqltopg'
   # 只绑 127.0.0.1：本服务没有入站业务流量，/health 只给 VM 上的探针用，
@@ -60,8 +57,10 @@ stages:
               repository: $(imageRepository)
               dockerfile: $(dockerfilePath)
               containerRegistry: $(dockerRegistryServiceConnection)
+              # 只维护 latest 一个 tag（按要求：ACR 里只保留最新镜像）。
+              # ⚠️ 代价：没有历史 tag 可回滚。真要回滚只能重新构建上一个 commit，
+              #    或临时改成也推 $(Build.SourceVersion)。
               tags: |
-                $(tag)
                 latest
 
   - stage: Deploy
@@ -88,9 +87,7 @@ stages:
                 # HTTP 服务和健康检查都正常，只是同步一直失败，部署会"看起来成功"。
                 test -f docker-compose.yml || { echo "✗ $(deployDir)/docker-compose.yml 不存在"; exit 1; }
                 test -f .env              || { echo "✗ $(deployDir)/.env 不存在"; exit 1; }
-                # 钉到本次构建的 git sha，而不是 latest —— 部署了哪个 commit 一目了然
-                export SQLTOPG_TAG=$(tag)
-                docker compose pull
+                docker compose pull   # compose 里钉的是 :latest
                 # 单实例：compose 会先停旧容器再起新的（见 compose 文件头的说明）
                 docker compose up -d
                 # 等健康检查转 healthy 再宣告成功，否则容器起不来也会显示部署通过。

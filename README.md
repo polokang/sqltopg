@@ -13,17 +13,22 @@
 
 ```
 src/
-├── initDatabase.js              # 删除并重建 PG 所有表/视图
+│  ── 同步运行时需要的 6 个文件（会打进镜像）──────────────────────────
+├── index.js                     # 调度 + 健康检查服务入口
+├── sync-simple.js               # 同步主逻辑（全量 UPSERT + 孤儿清理）
 ├── derive.js                    # ★ 全部派生规则的唯一实现（迁移与同步共用）
-├── syncLog.js                   # 同步运行日志（写 sync_runs 表，独立连接）
-├── upserts.js                   # ★ 四张表的批量 UPSERT 语句（jsonb_to_recordset）
-├── migration-user.js            # 迁移 UserInfomation → users
-├── migration-company.js         # 迁移 CompanyInfomation → companies
-├── migration-controller.js      # 迁移 ControllerInfo → controllers
-├── migration-assignment.js      # 迁移 UserControllerAssignment → user_controller_assignments
-├── progress.js                  # 进度条输出工具
-├── sync-simple.js               # 常驻同步逻辑（UPSERT + 孤儿清理）
-└── index.js                     # 定时任务 + 健康检查服务入口
+├── upserts.js                   # ★ 四张表的批量 UPSERT（jsonb_to_recordset）
+├── syncLog.js                   # 运行日志（写 sync_runs 表，独立连接）
+├── dbConfig.js                  # ★ 连接串解析的唯一实现
+│
+│  ── 一次性工具，只在本地跑；Dockerfile 会把它们从镜像里删掉 ────────────
+├── initDatabase.js              # 删除并重建 PG 的表/视图
+├── migration-user.js            # UserInfomation → users
+├── migration-company.js         # CompanyInfomation → companies
+├── migration-controller.js      # ControllerInfo → controllers
+├── migration-assignment.js      # UserControllerAssignment → user_controller_assignments
+└── progress.js                  # 进度条（只被 migration-* 使用）
+
 Dockerfile                       # 运行定时同步服务的镜像
 ```
 
@@ -52,19 +57,31 @@ Dockerfile                       # 运行定时同步服务的镜像
 
 ## 调度与运行日志
 
-**每天布里斯班时间 00:00 一次。** 相关环境变量：
+调度由 `.env` 里的 **`SYNC_INTERVAL_MINUTES`** 决定，两种模式二选一：
+
+| 值 | 模式 | 说明 |
+|---|---|---|
+| `0`（或留空） | **每天定时** | 时刻由 `SYNC_AT_HOUR` + `SYNC_TIMEZONE` 决定 |
+| `>0` | **按间隔** | 每 N 分钟一次；`SYNC_AT_HOUR` / `SYNC_TIMEZONE` 不再参与调度 |
 
 ```ini
-SYNC_TIMEZONE=Australia/Brisbane   # IANA 时区名
-SYNC_AT_HOUR=0                     # 0 = 午夜
-SYNC_ON_STARTUP=true               # 服务启动时先补一次（默认开，部署完立刻知道通不通）
+SYNC_INTERVAL_MINUTES=0             # 0=每天定时；>0=按分钟间隔
+SYNC_AT_HOUR=0                      # 仅 SYNC_INTERVAL_MINUTES=0 时生效
+SYNC_TIMEZONE=Australia/Brisbane    # 仅 SYNC_INTERVAL_MINUTES=0 时生效
+SYNC_ON_STARTUP=true                # 启动时先补跑一次
 ```
 
-用 `setTimeout` 递归而不是 `setInterval`：每轮结束后按时区重新计算下一次，
-不会累计漂移。昆士兰不实行夏令时（全年 UTC+10），但代码按 IANA 时区名算，
-换到有夏令时的时区也正确。
+⚠️ **间隔模式下限 5 分钟。** 填更小的值会被自动提升到 5 并打告警。单轮实测约
+2 秒（2026-09-09，本机 → Azure PG），5 分钟留了两个数量级余量。真要更密，
+先看 `sync_runs.duration_ms` 的实际耗时。
 
-想立刻手工跑一次：`npm run sync`（记为 `trigger_source = 'manual'`）。
+⚠️ **这个值同时决定双写的自愈窗口。** mirror 写失败后，最长要等一个周期才会被
+同步纠正 —— 每天一次 = 最长 24 小时。见台账 R-213。
+
+两种模式都用 `setTimeout` 递归而非 `setInterval`：每天定时下不会累计漂移、
+夏令时也正确；按间隔下，间隔从"上一轮结束"起算，保证两轮之间真有这么长的空档。
+
+手工跑一次：`npm run sync`（记为 `trigger_source = 'manual'`）。
 
 ### `sync_runs` —— 每次同步的记录
 
@@ -135,11 +152,19 @@ POSTGRESQL_URL=postgresql://<user>:<pw>@<host>:5432/AquariusPG
 # 同步服务 HTTP 端口（index.js 使用，可选，默认 3000）
 PORT=3000
 
-# 调度（可选，默认值即下方所示）
-SYNC_TIMEZONE=Australia/Brisbane   # IANA 时区名
-SYNC_AT_HOUR=0                     # 每天几点跑，0 = 午夜
+# 调度（可选，默认值即下方所示）—— 详见上文"调度与运行日志"
+SYNC_INTERVAL_MINUTES=0            # 0=每天定时；>0=每 N 分钟（下限 5）
+SYNC_AT_HOUR=0                     # 仅 SYNC_INTERVAL_MINUTES=0 时生效
+SYNC_TIMEZONE=Australia/Brisbane   # 仅 SYNC_INTERVAL_MINUTES=0 时生效
 SYNC_ON_STARTUP=true               # 服务启动时先补跑一次
 ```
+
+完整带注释的模板见 [`.env.example`](.env.example)。
+
+⚠️ **容器部署时不要把这些写进 `docker-compose.yml` 的 `environment:`**。
+`dotenv` 不覆盖已存在的环境变量 —— 写在那里会让 `.env` 里的同名值被静默忽略，
+你改了 `.env`、重启、发现毫无变化，而且没有任何提示。
+compose 里只留 `PORT`（它必须与端口映射一致）。
 
 > ⚠️ `SQL_SERVER_URL` 里的 `database=` **决定了实际读哪个库** —— 查询用的是
 > 三段式表名 `<database>.dbo.<table>`，库名从这里取。以前是硬编码的

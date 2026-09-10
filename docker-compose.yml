@@ -10,26 +10,33 @@
 #
 # ── 为什么用挂载 .env 而不是 env_file / -e ────────────────────────────────────
 #
-# 三种方式的区别，踩过才知道：
-#
 #   docker run -e VAR='…'   值原样传入。.env 里的值是带引号写的，复制过去引号会
 #                           进到值里，污染末位参数 trustServerCertificate，
-#                           表现为 "self-signed certificate" 连接失败。
-#   env_file:               Docker 各版本对引号的处理不完全一致，不想赌。
+#                           表现为 "self-signed certificate" 连接失败
+#   env_file:               Docker 各版本对引号的处理不完全一致，不赌
 #   volumes: ./.env:/app/.env   ← 采用这个
 #                           文件原样进容器，由应用自己的 dotenv 解析 ——
 #                           dotenv 会剥引号、也能容忍 CRLF。与 adminpage 一致。
 #
-# ⚠️ 权限：镜像以非 root 的 uid 1001 运行（Dockerfile 里的 USER nodejs），
-#    所以宿主机上的 .env 必须让 uid 1001 读得到：
+# ⚠️ **所有可调参数都放在 .env 里，这个文件的 environment: 只留 PORT。**
+#
+#    原因：`dotenv.config()` **不会覆盖已存在的环境变量**。只要某个变量出现在
+#    下面的 environment: 里，容器启动时它就已经在 process.env 中，.env 里的
+#    同名值会被静默忽略 —— 你改了 .env、重启、发现毫无变化，且没有任何提示。
+#
+#    PORT 是唯一的例外：它必须与下面 ports 的容器侧端口一致，属于编排结构而不是
+#    业务配置，所以钉在这里，防止有人在 .env 里改了它把端口映射弄坏。
+#
+# ⚠️ .env 的权限：镜像以非 root 的 uid 1001 运行（Dockerfile 的 USER nodejs），
+#    宿主机文件必须让 1001 读得到：
 #
 #        chmod 700 ~/sqltopg        # 目录：挡住宿主机上的其他用户
 #        chmod 644 ~/sqltopg/.env   # 文件：容器里的 1001 才读得到
 #
-#    看起来 644 很松，但父目录是 700，宿主机上别的普通用户根本进不来这个目录；
-#    容器里能读是因为 bind-mount 直接挂的是文件本身，不经过父目录。
-#    若 .env 设成 600，容器会读不到 —— 应用会在启动时明确报错并给出自查命令
-#    （src/dbConfig.js 的 requireEnv），不会静默失败。
+#    644 看着松，但父目录 700 已经挡住了宿主机上别的普通用户；容器能读是因为
+#    bind-mount 直接挂的是文件本身、不经过父目录。设成 600 容器读不到 ——
+#    应用会在启动时明确报错并给出自查命令（src/dbConfig.js 的 requireEnv），
+#    不会静默失败。
 #
 # ⚠️ 本服务**只能单实例**：每轮做全量 UPSERT + 孤儿清理，两个实例并跑会在
 #    DELETE 上互相干扰。不要 `--scale`，也不要在多台机器上同时起。
@@ -38,25 +45,21 @@
 
 services:
   sqltopg:
-    # 默认拉 latest；要钉某个版本就 `SQLTOPG_TAG=v2.0 docker compose up -d`
-    image: adminpage.azurecr.io/sqltopg:${SQLTOPG_TAG:-latest}
+    image: adminpage.azurecr.io/sqltopg:latest
     container_name: sqltopg
     restart: always
 
     # 只绑 127.0.0.1：本服务没有入站业务流量，这个端口只给宿主机上的
-    # 健康探针/排查用，不应该暴露到公网
+    # 健康探针 / 排查用，不应该暴露到公网
     ports:
       - "127.0.0.1:8087:3000"
 
     environment:
-      # 凭据不在这里 —— 见下面的 volumes
+      # 见文件头：这里只放 PORT，其余一律走 .env
       PORT: "3000"
-      SYNC_TIMEZONE: Australia/Brisbane   # 昆士兰全年 UTC+10，无夏令时
-      SYNC_AT_HOUR: "0"                   # 每天 00:00（布里斯班）
-      SYNC_ON_STARTUP: "true"             # 起容器时先补跑一次，部署完立刻知道通不通
 
     volumes:
-      # 【宿主机 .env : 容器内 /app/.env】—— 凭据只在宿主机上，不进镜像。
+      # 【宿主机 .env : 容器内 /app/.env】—— 凭据与全部可调参数都在这里，不进镜像。
       # 只读挂载：容器没有任何理由改它。
       - ./.env:/app/.env:ro
 

@@ -20,7 +20,20 @@ COPY package*.json ./
 # 只安装生产依赖（--only=production 已废弃，改用 --omit=dev）
 RUN npm ci --omit=dev
 
+# 只保留**同步运行时**需要的文件。initDatabase / migration-* 是一次性的建库与
+# 数据迁移工具，只在本地对着目标库跑，不该出现在长期运行的服务镜像里 ——
+# 它们进了镜像就等于把"删库重建"的能力放在了生产容器里。
+#
+# 做法是先整体 COPY 再删掉工具文件，而不是逐个列出要保留的：
+# 这样将来新增运行时模块会自动包含进来，忘记改 Dockerfile 也不会在容器里
+# 报 "Cannot find module"。反过来（列白名单）漏一个就是运行时崩溃。
+#
+# 运行时闭包（从 index.js 出发的 import 链）：
+#   index.js → sync-simple.js → derive.js / dbConfig.js / syncLog.js / upserts.js
+# progress.js 只被 migration-* 用，一并删掉。
 COPY src ./src
+RUN rm -f src/initDatabase.js src/migration-*.js src/progress.js && \
+    echo "镜像内保留的运行时文件：" && ls -1 src
 
 # 创建非 root 用户
 RUN groupadd -r nodejs -g 1001 && \
