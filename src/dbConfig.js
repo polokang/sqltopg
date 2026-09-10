@@ -76,6 +76,29 @@ export function parseSqlServerUrl(url = '') {
 }
 
 /**
+ * 启动时校验必需的连接串都在。
+ *
+ * ⚠️ 为什么需要这个：容器化部署时 .env 是从宿主机 bind-mount 进来的
+ * （`./.env:/app/.env`）。文件缺失、或者宿主机权限不允许容器里的 uid 读取时，
+ * `dotenv.config()` **不抛异常**，只是安静地什么都不做。于是连接串是 undefined，
+ * 最终表现成 `Failed to connect to undefined:1433` 之类看不懂的错误 ——
+ * 而真正的原因是一个文件没挂上。
+ *
+ * 所以这里主动检查并给出可操作的提示。
+ */
+function requireEnv(name) {
+    const v = String(process.env[name] ?? '').trim();
+    if (v) return v;
+    throw new Error(
+        `缺少环境变量 ${name}。\n` +
+        `  · 本地运行：确认项目根目录有 .env 且包含 ${name}=…\n` +
+        `  · 容器运行：确认宿主机的 .env 已挂到 /app/.env，且**容器内的用户读得到**\n` +
+        `    （镜像以 uid 1001 运行；宿主机文件建议 chmod 644，靠父目录 700 做隔离）。\n` +
+        `    自查：docker exec <容器> sh -c 'ls -l /app/.env && head -c 20 /app/.env'`,
+    );
+}
+
+/**
  * 从环境变量取 SQL Server 配置。
  *
  * @returns {{cfg: object, srcDb: string}} srcDb 是三段式表名用的库名 ——
@@ -84,7 +107,7 @@ export function parseSqlServerUrl(url = '') {
  *   而且不报错（2026-09-09 修）。
  */
 export function getSqlServerConfig() {
-    const cfg = parseSqlServerUrl(process.env.SQL_SERVER_URL || '');
+    const cfg = parseSqlServerUrl(requireEnv('SQL_SERVER_URL'));
     return { cfg, srcDb: cfg.database || 'AquariusEmailDB' };
 }
 
@@ -93,7 +116,7 @@ export function getSqlServerConfig() {
  * 错误信息也很难指向真正的原因。
  */
 export function getPostgresUrl() {
-    const { value, stripped } = unquote(process.env.POSTGRESQL_URL || '');
+    const { value, stripped } = unquote(requireEnv('POSTGRESQL_URL'));
     if (stripped && !warnedPg) {
         console.warn('⚠ POSTGRESQL_URL 的值带着外层引号，已自动剥掉。请去掉环境变量里的引号。');
         warnedPg = true;

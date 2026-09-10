@@ -1,24 +1,25 @@
 # sqltopg —— SQL Server → PostgreSQL 同步服务
 #
-# 与 adminpage-api 同一套模式：构建镜像 → 推 ACR → SSH 到 Azure VM → docker run。
+# 构建镜像 → 推 ACR → SSH 到 Azure VM → docker compose pull && up -d。
+# （adminpage-api 用的是 docker run；这里改用 compose，与服务器上的手工操作一致。）
 #
 # ⚠️ 凭据**绝不打进镜像**（Dockerfile 里那行 COPY .env 已于 2026-09-09 移除），
-#    而是由服务器上的一个文件提供，运行时用 --env-file 读：
+#    而是由服务器上的部署目录提供：
 #
-#        /home/aquacentosadmin/sqltopg/.env
+#        /home/aquacentosadmin/sqltopg/
+#          ├── docker-compose.yml   服务定义（仓库根目录同名文件，首次 scp 过来）
+#          └── .env                 凭据，被 compose 以 volume 挂进容器的 /app/.env
 #
-#    该文件由人工维护，只放两个连接串，权限 600。流水线因此**不需要**持有任何
-#    凭据 —— 换口令只改服务器上那一个文件，不用动 pipeline 变量。
+#    这两个文件由人工维护，流水线**不持有任何凭据** —— 换口令只改服务器上那一个
+#    文件，不用动 pipeline 变量。
 #
-#    ⚠️ 该文件必须是 **LF 行尾、值不带引号**。Docker 的 --env-file 与 dotenv 不同：
-#       它不剥引号、也不处理 CRLF，`"…"` 以及行尾的 CR 都会变成值的一部分。
-#       末位参数 trustServerCertificate 被污染后表现为
-#       "self-signed certificate" 连接失败 —— 错误信息完全指不到真正原因。
-#       （v2.0 的 src/dbConfig.js 会兜住并告警，但不要依赖它。）
+#    ⚠️ .env 的权限：镜像以非 root 的 uid 1001 运行，宿主机文件要
+#       chmod 644（父目录 chmod 700 做隔离）。设成 600 容器读不到，
+#       应用会在启动时明确报错（src/dbConfig.js 的 requireEnv），不会静默失败。
 #
 # ⚠️ 本服务**只能跑单实例**。它每轮做全量 UPSERT + 孤儿清理，两个实例同时跑
-#    会在 DELETE 上互相干扰。所以部署脚本是"先 stop/rm 旧容器再 run"，
-#    不要改成滚动更新或多副本。
+#    会在 DELETE 上互相干扰。compose 的 up -d 是"先停旧容器再起新的"，符合要求；
+#    但不要 `--scale`，也不要在多台机器上同时起。
 
 trigger:
   - main
@@ -35,12 +36,13 @@ variables:
   # 用 git sha 而不是写死的 'test' —— 出问题时能确定线上跑的到底是哪个 commit，
   # 也才有办法回滚（adminpage-api 的 tag 写死成 'test'，回滚时无从下手）
   tag: '$(Build.SourceVersion)'
-  containerName: 'sqltopg_container'
+  # 必须与 docker-compose.yml 里的 container_name 一致，否则健康等待查不到容器
+  containerName: 'sqltopg'
   # 只绑 127.0.0.1：本服务没有入站业务流量，/health 只给 VM 上的探针用，
   # 不需要、也不应该暴露到公网
   healthPort: '8087'
-  # 服务器上存放凭据的文件，人工维护（见文件头说明）
-  envFile: '/home/aquacentosadmin/sqltopg/.env'
+  # 服务器上的部署目录，里面放 docker-compose.yml 与 .env（人工维护）
+  deployDir: '/home/aquacentosadmin/sqltopg'
   vmImageName: 'ubuntu-latest'
 
 stages:
@@ -78,24 +80,19 @@ stages:
               runOptions: 'commands'
               commands: |
                 set -e
-                docker pull $(containerRegistry)/$(imageRepository):$(tag)
-                # 单实例：先停旧的再起新的（见文件头的说明）
-                docker stop $(containerName) || true
-                docker rm   $(containerName) || true
-                # 凭据文件必须在位。少了它容器照样能起来、HTTP 服务和健康检查都正常，
-                # 只是同步一直失败 —— 所以在这里硬性拦一道，别让部署"看起来成功"。
-                test -f $(envFile) || { echo "✗ 缺少凭据文件 $(envFile)"; exit 1; }
-                docker run -d \
-                  --name $(containerName) \
-                  --restart unless-stopped \
-                  -p 127.0.0.1:$(healthPort):3000 \
-                  --log-opt max-size=10m --log-opt max-file=3 \
-                  --env-file $(envFile) \
-                  -e PORT=3000 \
-                  -e SYNC_TIMEZONE=Australia/Brisbane \
-                  -e SYNC_AT_HOUR=0 \
-                  -e SYNC_ON_STARTUP=true \
-                  $(containerRegistry)/$(imageRepository):$(tag)
+                cd $(deployDir)
+                # 这两个文件由人工维护在服务器上，不由流水线下发：
+                #   docker-compose.yml  服务定义（仓库里有同名文件，首次部署 scp 过来）
+                #   .env                凭据
+                # 少了任何一个都要立刻失败 —— 尤其是 .env：缺了它容器照样能起来、
+                # HTTP 服务和健康检查都正常，只是同步一直失败，部署会"看起来成功"。
+                test -f docker-compose.yml || { echo "✗ $(deployDir)/docker-compose.yml 不存在"; exit 1; }
+                test -f .env              || { echo "✗ $(deployDir)/.env 不存在"; exit 1; }
+                # 钉到本次构建的 git sha，而不是 latest —— 部署了哪个 commit 一目了然
+                export SQLTOPG_TAG=$(tag)
+                docker compose pull
+                # 单实例：compose 会先停旧容器再起新的（见 compose 文件头的说明）
+                docker compose up -d
                 # 等健康检查转 healthy 再宣告成功，否则容器起不来也会显示部署通过。
                 #
                 # ⚠️ 这里**不能用 $(...) 做命令替换** —— Azure Pipelines 的变量宏

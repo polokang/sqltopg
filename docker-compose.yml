@@ -1,0 +1,69 @@
+# sqltopg —— SQL Server → PostgreSQL 同步服务
+#
+# 服务器上的用法（目录：~/sqltopg）：
+#     docker compose pull
+#     docker compose up -d
+#     docker compose logs -f
+#
+# 结构照 adminpage/docker-compose.yml 来：镜像从 ACR 拉、restart always、
+# 用 bind-mount 把宿主机的 .env 挂进容器。
+#
+# ── 为什么用挂载 .env 而不是 env_file / -e ────────────────────────────────────
+#
+# 三种方式的区别，踩过才知道：
+#
+#   docker run -e VAR='…'   值原样传入。.env 里的值是带引号写的，复制过去引号会
+#                           进到值里，污染末位参数 trustServerCertificate，
+#                           表现为 "self-signed certificate" 连接失败。
+#   env_file:               Docker 各版本对引号的处理不完全一致，不想赌。
+#   volumes: ./.env:/app/.env   ← 采用这个
+#                           文件原样进容器，由应用自己的 dotenv 解析 ——
+#                           dotenv 会剥引号、也能容忍 CRLF。与 adminpage 一致。
+#
+# ⚠️ 权限：镜像以非 root 的 uid 1001 运行（Dockerfile 里的 USER nodejs），
+#    所以宿主机上的 .env 必须让 uid 1001 读得到：
+#
+#        chmod 700 ~/sqltopg        # 目录：挡住宿主机上的其他用户
+#        chmod 644 ~/sqltopg/.env   # 文件：容器里的 1001 才读得到
+#
+#    看起来 644 很松，但父目录是 700，宿主机上别的普通用户根本进不来这个目录；
+#    容器里能读是因为 bind-mount 直接挂的是文件本身，不经过父目录。
+#    若 .env 设成 600，容器会读不到 —— 应用会在启动时明确报错并给出自查命令
+#    （src/dbConfig.js 的 requireEnv），不会静默失败。
+#
+# ⚠️ 本服务**只能单实例**：每轮做全量 UPSERT + 孤儿清理，两个实例并跑会在
+#    DELETE 上互相干扰。不要 `--scale`，也不要在多台机器上同时起。
+#
+# 不写 `version:` —— Compose V2 已废弃该字段，写了每次都会告警。
+
+services:
+  sqltopg:
+    # 默认拉 latest；要钉某个版本就 `SQLTOPG_TAG=v2.0 docker compose up -d`
+    image: adminpage.azurecr.io/sqltopg:${SQLTOPG_TAG:-latest}
+    container_name: sqltopg
+    restart: always
+
+    # 只绑 127.0.0.1：本服务没有入站业务流量，这个端口只给宿主机上的
+    # 健康探针/排查用，不应该暴露到公网
+    ports:
+      - "127.0.0.1:8087:3000"
+
+    environment:
+      # 凭据不在这里 —— 见下面的 volumes
+      PORT: "3000"
+      SYNC_TIMEZONE: Australia/Brisbane   # 昆士兰全年 UTC+10，无夏令时
+      SYNC_AT_HOUR: "0"                   # 每天 00:00（布里斯班）
+      SYNC_ON_STARTUP: "true"             # 起容器时先补跑一次，部署完立刻知道通不通
+
+    volumes:
+      # 【宿主机 .env : 容器内 /app/.env】—— 凭据只在宿主机上，不进镜像。
+      # 只读挂载：容器没有任何理由改它。
+      - ./.env:/app/.env:ro
+
+    # 容器只往 stdout 打日志（不写文件），所以不需要 logs 卷，
+    # 但要限制大小，否则日志会无限增长
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
