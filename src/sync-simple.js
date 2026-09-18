@@ -25,7 +25,8 @@
  *    2 分钟翻来翻去、且极难排查。规则只允许写在 derive.js 里，两边 import 同一个
  *    函数 —— 历史上这两边的邮箱去重逻辑就已经漂过（sync 保留一行，migration 中止）。
  *
- * I2 **孤儿清理只删 sync_source = 'mssql' 的行。**
+ * I2 **只有 user_controller_assignments 上还有 sync_source，孤儿清理只删该表的 'mssql' 行。**
+ *    users / controllers 已去掉这一列 —— 两张表整表来自 SQL Server，没有 Pro 自建行。
  *    双写期 Pro 会往 PG 写 sync_source='pro' 的行（例如给 Manager 存告警偏好），
  *    这些行在 SQL Server 里没有对应记录，无条件清理会把它们静默删掉。（台账 R-008）
  *
@@ -61,6 +62,8 @@ import {
   dedupeUsersByEmail,
   mergeAssignmentsByPair,
   parseTags,
+  deriveCommType,
+  deriveControllerModel,
   toBool,
   nullIfBlank,
 } from './derive.js';
@@ -219,10 +222,11 @@ async function syncUsers(pgClient, mssqlPool) {
 
   const upserted = await upsertChunked(pgClient, UPSERT_USERS, payload);
 
-  // 孤儿清理：只删来自 SQL Server 的行（不变式 I2）
+  // 孤儿清理：删掉源库里已经不存在的行。
+  // users 上不再有 sync_source —— 这张表整表来自 SQL Server，没有 Pro 自建的行。
   const del = await pgClient.query(
     `DELETE FROM users
-      WHERE sync_source = 'mssql' AND user_id <> ALL($1::int[])`,
+      WHERE user_id <> ALL($1::int[])`,
     [[...validUserIds]],
   );
   console.log(`  实际写入 ${upserted} / ${rows.length} 行，清理 ${del.rowCount} 条陈旧记录`);
@@ -269,15 +273,20 @@ async function syncControllers(pgClient, mssqlPool, validUserIds, validCompanyId
     if (companyId != null && !validCompanyIds.has(companyId)) { companyId = null; nulledCompany++; }
 
     validUnitIds.add(row.UnitId);
+
+    // SIMCardNo 一列拆三列：通信方式 / 真卡号 / 原始串（见 derive.js）
+    const comm = deriveCommType(row.SIMCardNo);
+
     return {
       unit_id:           row.UnitId,
       serial_no:         row.SerialNo || null,
-      sim_card_no:       row.SIMCardNo,
+      sim_card_no:       comm.simCardNo,
+      comm_types:        comm.commTypes,
       owner_user_id:     ownerId,
       company_id:        companyId,
       system_id:         row.SystemID,
-      firmware_version:  row.FirmwareVersion || null,
-      model_type:        row.ControllerModel || null,
+      system_type:       nullIfBlank(row.FirmwareVersion),
+      model_code:        deriveControllerModel(row.ControllerModel),
       timezone_id:       row.LinuxTimeZoneId || null,
       production_status: row.ProductionStatus ?? null,
       activated:         toBool(row.Activated),
@@ -295,9 +304,10 @@ async function syncControllers(pgClient, mssqlPool, validUserIds, validCompanyId
 
   const upserted = await upsertChunked(pgClient, UPSERT_CONTROLLERS, payload);
 
+  // controllers 同样不再有 sync_source（理由见 users 处）。
   const del = await pgClient.query(
     `DELETE FROM controllers
-      WHERE sync_source = 'mssql' AND unit_id <> ALL($1::int[])`,
+      WHERE unit_id <> ALL($1::int[])`,
     [[...validUnitIds]],
   );
   console.log(

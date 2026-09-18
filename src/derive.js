@@ -106,6 +106,68 @@ export function deriveManagedCompanyIds(userTypeId, companyId) {
  */
 export const deriveJwCode = (jwCode) => nullIfBlank(jwCode);
 
+/**
+ * controllers.model_type ← ControllerInfo.ControllerModel（生产物料型号）
+ *
+ * 做两件事：
+ *
+ * ① **去掉定长填充。** 源列是 `nchar(30)`，mssql 驱动把值原样带着尾随空格返回：
+ *    `"ULTIMA3P                      "`。此前没处理，导致 PG 里 7980 行全是 30
+ *    字符的填充值 —— `WHERE model_type = 'ULTIMA3P'` 一条都查不到，必须写成
+ *    `btrim(model_type) = …`。这是 2026-09-18 发现并修的。
+ *
+ * ② **字符串 'NONE' → NULL。** 源库有 255 台的值是字面量 'NONE'（不是 NULL），
+ *    那是"没填"的占位写法。照抄过来的话，PG 里就会出现一个叫 "NONE" 的合法型号，
+ *    统计和下拉框都会把它当成真型号。真正的空值应该用 NULL 表达。
+ *    源库另有 60 台本来就是 NULL，0 台是空字符串。
+ *
+ * ③ **统一成大写。** 源库同一个型号存在多种大小写写法：'Ultima3p' / 'Ultima3P'
+ *    / 'ULTIMA3P' 是同一个型号的三种写法。SQL Server 的默认排序规则
+ *    SQL_Latin1_General_CP1_CI_AS 大小写不敏感，把它们当成同一个值，所以旧站
+ *    看不出问题；PG 区分大小写，照抄过来同一型号会在统计里裂成 2-3 行、下拉框
+ *    出现重复项、按型号筛选漏数据。
+ *
+ *    2026-09-18 实查：13 组型号有大小写变体，共涉及 2964 台设备。
+ *
+ * ⚠️ 只认 'NONE'（忽略大小写）。'N/A' / '-' 这类占位符在生产数据里不存在
+ *    （2026-09-18 实查），不做推测性处理 —— 真出现了应该先看清是什么再加规则。
+ *
+ * ④ **修正带空格的手误写法**，见下方 MODEL_ALIASES。7 个值、共 10 台。
+ *
+ * ⑤ **把非型号的占位文本归为 NULL**，见下方 MODEL_PLACEHOLDERS。
+ */
+/**
+ * 带空格的手误写法 → 库里真实存在的型号。
+ *
+ * ⚠️ **不能统一用"去掉空格"处理**。2026-09-18 逐个核对：7 个带空格的值里，
+ *    3 个去空格后能命中已有型号，4 个必须换成下划线，去空格反而会造出
+ *    PANELULTIMA / ULTIMANP / X_PANULTIMA / PANELUCT 这 4 个库里不存在的新型号。
+ *    右侧注释是该目标型号当前的设备数，即"这个映射确实落到了一个真型号上"的依据。
+ */
+const MODEL_ALIASES = {
+    'PANEL UCT':    'PANEL_UCT',     //  13 台
+    'PANEL ULTIMA': 'PANEL_ULTIMA',  // 131 台
+    'X_PAN ULTIMA': 'X_PAN_ULTIMA',  // 122 台
+    'ULTIMA NP':    'ULTIMA_NP',     // 600 台
+    'ULTIMA 2P':    'ULTIMA2P',      // 329 台
+    'ULTIMA 3P':    'ULTIMA3P',      // 809 台
+    'ULTIMA 3P4G':  'ULTIMA3P4G',    // 257 台
+};
+
+/**
+ * 不是型号的占位文本 → NULL。与 'NONE' 同理：它们表达的是"没填"，
+ * 留在库里会变成看起来合法的型号，污染统计与下拉框。各 1 台。
+ */
+const MODEL_PLACEHOLDERS = new Set(['NONE', 'NOT USED', 'SALES DEMO', 'S/N USED BY SALES']);
+
+export function deriveControllerModel(controllerModel) {
+    const v = nullIfBlank(controllerModel);   // nullIfBlank 已含 trim，填充在这里被去掉
+    if (v === null) return null;
+    const upper = v.toUpperCase();
+    if (MODEL_PLACEHOLDERS.has(upper)) return null;
+    return MODEL_ALIASES[upper] ?? upper;
+}
+
 /** controllers.tags ← Suburb（"tag1, tag2" 逗号分隔） */
 export function parseTags(suburb) {
     if (!suburb) return [];
@@ -114,6 +176,130 @@ export function parseTags(suburb) {
         .map((t) => t.trim())
         .filter(Boolean);
 }
+
+// ─── 通信方式 ────────────────────────────────────────────────────────────────
+
+/**
+ * controllers.comm_types 数组里的取值。
+ *
+ * 前五个与 adminpage 前端 config/defaultSettings.ts 的 commOption 一一对应：
+ *
+ *   SQL Server SIMCardNo   界面 label            PG comm_type
+ *   'Wifi'                 Wifi                  wifi
+ *   'Ethernet'             Ethernet              ethernet
+ *   数字开头（真实卡号）     Modem & SIM           sim
+ *   'NOSIMCARD'            Modem & No Sim Card   modem_no_sim
+ *   'None' / 空            None                  none
+ *   历史脏值                ——                    other   ← 第六个，见下
+ */
+export const COMM_TYPE = {
+    WIFI: 'wifi',
+    ETHERNET: 'ethernet',
+    SIM: 'sim',
+    MODEM_NO_SIM: 'modem_no_sim',
+    NONE: 'none',
+    OTHER: 'other',
+};
+
+/** 供 initDatabase.js 拼 CHECK 约束用 —— 取值清单只有这一份。 */
+export const COMM_TYPE_VALUES = Object.values(COMM_TYPE);
+
+/**
+ * 互斥值：出现了就必须是数组里**唯一**的元素。
+ *
+ *   none  —— "无通信"和"有 WiFi"不可能同时成立
+ *   other —— "没分类出来"是对整台设备的判断，不能和确定的方式并列
+ *
+ * initDatabase.js 的 CHECK 约束按这个清单生成，两处不会漂。
+ */
+export const COMM_TYPE_EXCLUSIVE = [COMM_TYPE.NONE, COMM_TYPE.OTHER];
+
+/**
+ * 把 SQL Server 的 dbo.ControllerInfo.SIMCardNo 一列拆成 **comm_types + sim_card_no**。
+ *
+ * ── 为什么要拆 ──────────────────────────────────────────────────────────────
+ *
+ * 老库把"通信方式"和"SIM 卡号"挤在同一列里。adminpage 的 Communication mode
+ * 下拉框选 Ethernet，前端就把字符串 'Ethernet' 原样写进 SIMCardNo
+ * （adminpage-web/src/pages/ControllerList/components/Edit.tsx 的 onChange:
+ *  `form.setFieldsValue({ SIMCardNo: form.getFieldValue('SimCardType') })`）。
+ * 于是任何想按通信方式统计的代码都得做字符串嗅探。2026-10 起的通信套餐按
+ * Ethernet / WiFi 划线收费，判据不能是嗅探出来的。
+ *
+ * ── 规则：包含式匹配，可叠加 ────────────────────────────────────────────────
+ *
+ *   ① 数字开头                → ['sim']，原值留在 sim_card_no
+ *   ② 归一化后包含 'wifi'     → 追加 'wifi'
+ *   ③ 包含 'eth'              → 追加 'ethernet'
+ *   ④ 包含 'sim' 或 'modem'   → 追加 'modem_no_sim'
+ *   ⑤ 以上都没命中：空 / 'none' → ['none']，其余 → ['other']
+ *
+ * ②③④ 是**累加**的，所以一台设备可以同时具备多种通信方式 —— 生产数据实测有
+ * 6 台：'OwnSimandEth,'(4) → {ethernet,modem_no_sim}，'NOSIMCARD,WIFI'(1) 与
+ * 'NowWifiPrevModem'(1) → {wifi,modem_no_sim}。
+ *
+ * 归一化 = 转小写 + 去掉所有非字母数字字符，用来吃掉历史写法变体
+ * （'WiFi Upgrade29Aug18' / 'NOSIMCARD,' / 'Modem & No Sim Card'）。
+ *
+ * ⚠️ ① 必须排在最前。2026-09-16 实查 AquariusDev：有 1899 个 distinct 值是数字
+ *    开头且含字母（'8000415794579N,0477183421' 这种卡号带后缀和联系电话），共
+ *    1994 台；其中只有 1 个含关键字（'80002006notfullsim'，本身就是 SIM）。
+ *    所以数字开头一律判 sim 是安全的；反过来先跑关键字匹配会把近 2000 台判错。
+ *
+ * ⚠️ 'none' 与 'other' 不能合并：
+ *      none  = 产线明确选了"无通信"        → 本来就不该有套餐
+ *      other = 老数据看不出来，需人工确认  → 缺套餐报表必须列出来
+ *    两者在 controllers_missing_subscription 上的处置完全相反。
+ *
+ * ⚠️ "数字开头 = 真实卡号"这条判据在三处各写了一份（本函数、前端 Edit.tsx、
+ *    后端 analysisController.classifyCommType）。改一处就要改三处。
+ *
+ * @param  {string|null} simCardNo  dbo.ControllerInfo.SIMCardNo（NChar(50)，带尾随空格）
+ * @return {{ commTypes: string[], simCardNo: string|null }}
+ */
+export function deriveCommType(simCardNo) {
+    const raw = nullIfBlank(simCardNo);
+
+    if (raw && /^\d/.test(raw)) {
+        return { commTypes: [COMM_TYPE.SIM], simCardNo: raw };
+    }
+
+    // 走到这里说明这一列存的不是卡号，sim_card_no 一律为 NULL。
+    const n = (raw ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
+
+    const types = [];
+    if (n.includes('wifi')) types.push(COMM_TYPE.WIFI);
+    if (n.includes('eth')) types.push(COMM_TYPE.ETHERNET);
+    if (n.includes('sim') || n.includes('modem')) types.push(COMM_TYPE.MODEM_NO_SIM);
+
+    if (types.length > 0) return { commTypes: types, simCardNo: null };
+
+    return {
+        commTypes: [!n || n === 'none' ? COMM_TYPE.NONE : COMM_TYPE.OTHER],
+        simCardNo: null,
+    };
+}
+
+/**
+ * 仍落在 'other' 的历史值 —— 342 台（2026-09-16 实查）。包含式匹配已经把
+ * 'DaveTestWiFi' / 'OwnSIM' / 'ModemUpgrade' 这些自动归位了，剩下的是**确实
+ * 看不出通信方式**的流程标记：
+ *
+ *   'NonWeb'        240 台   "不联网"，等同 none 还是另一种状态？
+ *   'Factory'        44 台   产线设备
+ *   'WebUpg' 系列    33 台   'WebUpgJan23' / 'webupg210226' … 升级标记
+ *   'SalesDemo' / 'slsdemo' / 'Unknown'      非客户设备
+ *   'usedBy602824' / 'repwith602636' / …     设备流转备注
+ *
+ * 这些要不要计费是商务判断，不猜。缺套餐报表会把它们列出来等人工认领；
+ * 认领完这里的台数应当单调下降，可以直接当数据质量进度条。
+ */
+export const COMM_TYPE_PENDING_REVIEW = Object.freeze({
+    nonWeb: ['nonweb'],
+    webUpgrade: ['webupg'],
+    testRig: ['factory', 'salesdemo', 'slsdemo', 'unknown'],
+    deviceNotes: ['usedby', 'repwith', 'progas'],
+});
 
 /**
  * user_controller_assignments.permission ← AccessLevel

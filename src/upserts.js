@@ -140,21 +140,24 @@ WHERE (users.company_id, users.email, users.email_verified, users.mobile,
 
 export const UPSERT_CONTROLLERS = `
 INSERT INTO controllers (
-  unit_id, serial_no, sim_card_no, owner_user_id, company_id,
-  system_id, firmware_version, model_type, timezone_id, production_status,
+  unit_id, serial_no, sim_card_no, comm_types, owner_user_id, company_id,
+  system_id, system_type, model_code, timezone_id, production_status,
   activated, created_at, updated_at, site_location, tags, billing_email,
   bar_code, po_number, spare_parts, notes
 )
 SELECT
-  x.unit_id, x.serial_no, x.sim_card_no, x.owner_user_id, x.company_id,
-  x.system_id, x.firmware_version, x.model_type, x.timezone_id, x.production_status,
+  x.unit_id, x.serial_no, x.sim_card_no,
+  ARRAY(SELECT jsonb_array_elements_text(x.comm_types))::varchar[],
+  x.owner_user_id, x.company_id,
+  x.system_id, x.system_type, x.model_code, x.timezone_id, x.production_status,
   x.activated, x.created_at, x.updated_at, x.site_location,
   ARRAY(SELECT jsonb_array_elements_text(x.tags))::text[],
   x.billing_email,
   x.bar_code, x.po_number, x.spare_parts, x.notes
   FROM jsonb_to_recordset($1::jsonb) AS x(
-    unit_id int, serial_no int, sim_card_no varchar, owner_user_id int, company_id int,
-    system_id varchar, firmware_version varchar, model_type varchar,
+    unit_id int, serial_no int, sim_card_no varchar, comm_types jsonb,
+    owner_user_id int, company_id int,
+    system_id varchar, system_type varchar, model_code varchar,
     timezone_id varchar, production_status int, activated boolean,
     created_at timestamptz, updated_at timestamptz, site_location varchar,
     tags jsonb, billing_email varchar,
@@ -163,11 +166,12 @@ SELECT
 ON CONFLICT (unit_id) DO UPDATE SET
   serial_no         = EXCLUDED.serial_no,
   sim_card_no       = EXCLUDED.sim_card_no,
+  comm_types        = EXCLUDED.comm_types,
   owner_user_id     = EXCLUDED.owner_user_id,
   company_id        = EXCLUDED.company_id,
   system_id         = EXCLUDED.system_id,
-  firmware_version  = EXCLUDED.firmware_version,
-  model_type        = EXCLUDED.model_type,
+  system_type       = EXCLUDED.system_type,
+  model_code        = EXCLUDED.model_code,
   timezone_id       = EXCLUDED.timezone_id,
   production_status = EXCLUDED.production_status,
   activated         = EXCLUDED.activated,
@@ -179,16 +183,20 @@ ON CONFLICT (unit_id) DO UPDATE SET
   po_number         = EXCLUDED.po_number,
   spare_parts       = EXCLUDED.spare_parts,
   notes             = EXCLUDED.notes
-WHERE (controllers.serial_no, controllers.sim_card_no, controllers.owner_user_id,
-       controllers.company_id, controllers.system_id, controllers.firmware_version,
-       controllers.model_type, controllers.timezone_id, controllers.production_status,
+WHERE (controllers.serial_no, controllers.sim_card_no,
+       controllers.comm_types, controllers.owner_user_id,
+       controllers.company_id, controllers.system_id,
+       controllers.system_type, controllers.model_code, controllers.timezone_id,
+       controllers.production_status,
        controllers.activated, controllers.updated_at, controllers.site_location,
        controllers.tags, controllers.billing_email, controllers.bar_code,
        controllers.po_number, controllers.spare_parts, controllers.notes)
   IS DISTINCT FROM
-      (EXCLUDED.serial_no, EXCLUDED.sim_card_no, EXCLUDED.owner_user_id,
-       EXCLUDED.company_id, EXCLUDED.system_id, EXCLUDED.firmware_version,
-       EXCLUDED.model_type, EXCLUDED.timezone_id, EXCLUDED.production_status,
+      (EXCLUDED.serial_no, EXCLUDED.sim_card_no,
+       EXCLUDED.comm_types, EXCLUDED.owner_user_id,
+       EXCLUDED.company_id, EXCLUDED.system_id,
+       EXCLUDED.system_type, EXCLUDED.model_code, EXCLUDED.timezone_id,
+       EXCLUDED.production_status,
        EXCLUDED.activated, EXCLUDED.updated_at, EXCLUDED.site_location,
        EXCLUDED.tags, EXCLUDED.billing_email, EXCLUDED.bar_code,
        EXCLUDED.po_number, EXCLUDED.spare_parts, EXCLUDED.notes)

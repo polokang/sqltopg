@@ -21,6 +21,7 @@
 import dotenv from 'dotenv';
 import pg from 'pg';
 import { getPostgresUrl } from './dbConfig.js';
+import { COMM_TYPE, COMM_TYPE_VALUES, COMM_TYPE_EXCLUSIVE } from './derive.js';
 
 dotenv.config();
 
@@ -39,6 +40,8 @@ async function initDatabase() {
 
     // ── 1. Drop views ────────────────────────────────────────────────────────
     console.log('Dropping views...');
+    await client.query(`DROP VIEW IF EXISTS controllers_missing_subscription CASCADE;`);
+    await client.query(`DROP VIEW IF EXISTS controller_subscription_status   CASCADE;`);
     await client.query(`DROP VIEW IF EXISTS active_user_controllers     CASCADE;`);
     await client.query(`DROP VIEW IF EXISTS controller_user_permissions CASCADE;`);
 
@@ -101,7 +104,10 @@ async function initDatabase() {
     //   · 切到 PG 权威（P6）后可以执行：
     //       ALTER TABLE users ALTER COLUMN user_id SET DEFAULT nextval('users_user_id_seq');
     //
-    // sync_source 标记行的来源，sqltopg 的孤儿清理只删 'mssql' 的行。
+    // ⚠️ 没有 sync_source 列。users 整表来自 SQL Server，不存在 Pro 自建的行，
+    //    孤儿清理直接按"源库里还在不在"判断即可。
+    //    （user_controller_assignments 保留了这一列 —— 那张表上 Pro 确实会写
+    //     sync_source='pro' 的行，见该表的说明。）
     //
     // roles —— 只有 super / manager / operator 三个值，由 UserTypeId 派生（见
     //   src/derive.js 的 deriveRoles）。**没有 owner** —— Owner 是 per-controller
@@ -135,9 +141,7 @@ async function initDatabase() {
         linked_providers    VARCHAR[]    NOT NULL DEFAULT '{}',
         last_login_at       TIMESTAMPTZ,
         created_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-        updated_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-        sync_source         VARCHAR(10)  NOT NULL DEFAULT 'mssql'
-                              CHECK (sync_source IN ('mssql', 'pro'))
+        updated_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW()
       );
     `);
     await client.query(`ALTER SEQUENCE users_user_id_seq OWNED BY users.user_id;`);
@@ -249,6 +253,28 @@ async function initDatabase() {
     //                       公司管理"），不是 Owner 所属公司。这是 Manager 权限的
     //                       判据（managed_company_ids ∋ company_id），取错会让
     //                       两站的可见范围不一致 —— 生产数据里两者有 223 台不同。
+    //   system_type       ← 旧名 FirmwareVersion。**装的不是固件版本**，而是设备的
+    //                       功能类型（CT / PRO / SP / ADV …共 13 个取值）。真正的固件
+    //                       版本在 MongoDB 的 ControllerStatus.FirmwareVer（'4:26081916'
+    //                       这种），firmware_version 这个名字留给它。
+    //                       公司自己的 DDLSetupVersionTable.SystemType 用的就是同一套
+    //                       词汇，沿用该叫法。
+    //   model_code        ← 旧名 ControllerModel。生产物料型号（ULTIMA3P / BSMARTAS6
+    //                       …共 175 种），编码了产品系列＋泵数＋通信＋变体。
+    //                       清洗规则见 derive.js 的 deriveControllerModel。
+    //   comm_types        ← 从 SIMCardNo **拆出来的新列**（数组）。老库把"通信方式"和
+    //                       "SIM 卡号"挤在同一列（选 Ethernet 就往 SIMCardNo 里
+    //                       写字符串 'Ethernet'），2026-10 的通信套餐要按
+    //                       Ethernet / WiFi 收费，判据不能靠字符串嗅探。
+    //                       拆分规则见 derive.js 的 deriveCommType。
+    //                       用数组是因为一台设备可以有多种通信方式（以太网 + 备用
+    //                       4G），生产数据里已有 4 台 'OwnSimandEth,'。计费判据
+    //                       写成 comm_types && ARRAY['ethernet','wifi'] 即可。
+    //
+    // sim_card_no 因此**从 NOT NULL 改为可空** —— 只有真的填了卡号才有值，
+    //   'Ethernet' / 'NOSIMCARD' / 'None' 这些非卡号的值不再往这一列灌。
+    //   原始字符串不再镜像到 PG（曾有过一个 comm_raw 列，已去掉）；需要追溯
+    //   'EthUpgApr19' 这类升级备注时回 SQL Server 的 dbo.ControllerInfo 查。
     //
     // owner_user_id ← AccManagerId。Owner 的权限是**运行时**按
     //   `owner_user_id == user_id` 判定的，不写进 users.roles（见 derive.js）。
@@ -257,12 +283,17 @@ async function initDatabase() {
       CREATE TABLE controllers (
         unit_id           INTEGER      PRIMARY KEY,
         serial_no         INTEGER,
-        sim_card_no       VARCHAR(50)  NOT NULL,
+        sim_card_no       VARCHAR(50),
+        comm_types        VARCHAR(20)[] NOT NULL DEFAULT ARRAY['none']::varchar[]
+                            CHECK (comm_types <@ ARRAY['wifi', 'ethernet', 'sim', 'modem_no_sim', 'none', 'other']::varchar[])
+                            CHECK (array_length(comm_types, 1) >= 1)
+                            CHECK (NOT (comm_types && ARRAY['none', 'other']::varchar[])
+                                   OR array_length(comm_types, 1) = 1),
         owner_user_id     INTEGER      REFERENCES users(user_id)         ON DELETE SET NULL,
         company_id        INTEGER      REFERENCES companies(company_id)  ON DELETE SET NULL,
         system_id         VARCHAR(100) NOT NULL,
-        firmware_version  VARCHAR(50),
-        model_type        VARCHAR(50),
+        system_type       VARCHAR(20),
+        model_code        VARCHAR(50),
         timezone_id       VARCHAR(50),
         production_status INTEGER,
         activated         BOOLEAN      NOT NULL DEFAULT false,
@@ -274,14 +305,15 @@ async function initDatabase() {
         spare_parts       VARCHAR(200),
         notes             TEXT,
         created_at        TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-        updated_at        TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-        sync_source       VARCHAR(10)  NOT NULL DEFAULT 'mssql'
-                            CHECK (sync_source IN ('mssql', 'pro'))
+        updated_at        TIMESTAMPTZ  NOT NULL DEFAULT NOW()
       );
     `);
     await client.query(`CREATE INDEX ON controllers (owner_user_id);`);
     await client.query(`CREATE INDEX ON controllers (company_id);`);
     await client.query(`CREATE INDEX ON controllers (activated);`);
+    // "哪些 Eth/WiFi 设备还没录通信套餐"这张报表按 comm_types 做集合相交
+    // （comm_types && ARRAY['ethernet','wifi']），GIN 是这类查询的索引类型
+    await client.query(`CREATE INDEX ON controllers USING GIN (comm_types);`);
     await client.query(`CREATE INDEX ON controllers (created_at);`);
 
     // ── 9. user_controller_assignments ───────────────────────────────────────
@@ -317,7 +349,79 @@ async function initDatabase() {
     await client.query(`CREATE INDEX ON user_controller_assignments (unit_id);`);
     await client.query(`CREATE INDEX ON user_controller_assignments (permission);`);
 
-    // ── 10. Views ────────────────────────────────────────────────────────────
+    // ── 10. controller_subscriptions —— 通信套餐订阅 ─────────────────────────
+    //
+    // 背景：2026-10-01 起，新出厂的以太网 / WiFi ULTIMA 随机附带 5 年 AquaReporter
+    // 通信套餐，到期后按 1 / 5 / 10 年续费。
+    //
+    // ⚠️ 与 sync_runs 同样处理：`CREATE TABLE IF NOT EXISTS`，且**刻意不在第 2 节的
+    //    DROP 列表里**。这是 Pro 自有的商务数据，SQL Server 里没有对应表，
+    //    重建镜像表绝不能把它清掉 —— 这里面是钱。
+    //
+    // ⚠️ unit_id **故意不加外键**。第 2 节的 `DROP TABLE controllers CASCADE` 会把
+    //    引用 controllers 的外键约束一并删除（表和数据不丢，但引用完整性没了，
+    //    而且不报错）。于是每跑一次 init-db 约束就悄悄消失一次。改用应用层校验 +
+    //    下面 controllers_missing_subscription 视图做定期孤儿检查。
+    //
+    // ── 几个设计决定 ─────────────────────────────────────────────────────────
+    //
+    // 仅追加（append-only）—— 续费是插一行，不是改一行。老库 ControllerInfo 上的
+    //   RenewalInv / RenewalDate 两个平列只能记住最后一次，这正是它撑不住新需求的
+    //   原因（表达不了起算日、期限、赠送 vs 付费、续费历史）。
+    //
+    // ordered_on vs starts_on —— 生产部门的 Release 只是出厂测试环节，不代表设备
+    //   正式售出，所以起算日不能自动取 Release 时间。ordered_on 由销售录入；
+    //   starts_on 默认等于它但可改（设备在经销商仓库躺半年的情况）。
+    //
+    // voided_at 而非 DELETE —— 财务数据录错了作废留痕，不物理删除。
+    //
+    // comm_types_at_sale —— 售出时的通信方式快照。设备日后升级通信方式不应改写
+    //   历史订阅的计费依据。
+    console.log('Creating controller_subscriptions (preserved across rebuilds)...');
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS controller_subscriptions (
+        id                 BIGSERIAL     PRIMARY KEY,
+        unit_id            INTEGER       NOT NULL,
+        kind               VARCHAR(20)   NOT NULL
+                             CHECK (kind IN ('included', 'renewal')),
+        term_years         SMALLINT      NOT NULL CHECK (term_years IN (1, 5, 10)),
+        ordered_on         DATE          NOT NULL,
+        starts_on          DATE          NOT NULL,
+        ends_on            DATE          NOT NULL,
+        invoice_no         VARCHAR(50),
+        po_number          VARCHAR(50),
+        sold_to_company_id INTEGER,
+        comm_types_at_sale VARCHAR(20)[] NOT NULL,
+        note               TEXT,
+        entered_by         INTEGER,
+        entered_at         TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+        voided_at          TIMESTAMPTZ,
+        voided_by          INTEGER,
+        voided_reason      TEXT,
+        CHECK (ends_on > starts_on),
+        CHECK ((voided_at IS NULL) = (voided_reason IS NULL))
+      );
+    `);
+    // 一台设备只能有一条**有效的**赠送套餐 —— 防销售重复录入
+    await client.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS controller_subscriptions_one_included_idx
+        ON controller_subscriptions (unit_id)
+        WHERE kind = 'included' AND voided_at IS NULL;`);
+    // 同一张发票不该在同一台设备上录两次
+    await client.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS controller_subscriptions_invoice_idx
+        ON controller_subscriptions (unit_id, invoice_no)
+        WHERE invoice_no IS NOT NULL AND voided_at IS NULL;`);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS controller_subscriptions_unit_idx
+        ON controller_subscriptions (unit_id, starts_on DESC);`);
+    // "还有几天到期"报表按 ends_on 排序
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS controller_subscriptions_expiry_idx
+        ON controller_subscriptions (ends_on)
+        WHERE voided_at IS NULL;`);
+
+    // ── 11. Views ────────────────────────────────────────────────────────────
     // 旧的 "UserFullInfo" 是 users 的纯投影，没有抽象价值，不再重建。
     console.log('Creating views...');
     await client.query(`
@@ -356,7 +460,50 @@ async function initDatabase() {
          AND c.activated = true;
     `);
 
-    // ── 11. sync_runs —— 同步运行日志 ────────────────────────────────────────
+    // 每台设备的当前订阅状态。取 ends_on 最大的那条有效记录 —— 续费是插新行，
+    // "当前到期日"就是所有未作废记录里最晚的那个。
+    await client.query(`
+      CREATE VIEW controller_subscription_status AS
+      SELECT c.unit_id,
+             c.system_id,
+             c.comm_types,
+             c.activated,
+             c.production_status,
+             c.company_id,
+             s.id           AS latest_subscription_id,
+             s.kind         AS latest_kind,
+             s.term_years   AS latest_term_years,
+             s.starts_on,
+             s.ends_on      AS expires_on,
+             s.invoice_no,
+             (s.id IS NULL)             AS is_missing,
+             (s.ends_on < CURRENT_DATE) AS is_expired,
+             (s.ends_on - CURRENT_DATE) AS days_remaining
+        FROM controllers c
+        LEFT JOIN LATERAL (
+               SELECT * FROM controller_subscriptions x
+                WHERE x.unit_id = c.unit_id AND x.voided_at IS NULL
+                ORDER BY x.ends_on DESC
+                LIMIT 1
+             ) s ON true;
+    `);
+
+    // 缺套餐报表 —— 人工录入的字段如果没有完整性检查就一定会烂掉，这张视图就是
+    // 那个检查。口径：在网的以太网 / WiFi 设备而没有任何有效订阅。
+    //
+    // comm_types 里含 'other' 的设备**也列出来**：那是老数据没分类出来、需要人工
+    // 认领的，与产线明确选了 'none' 的处置相反（见 derive.js 的说明）。
+    await client.query(`
+      CREATE VIEW controllers_missing_subscription AS
+      SELECT unit_id, system_id, comm_types, company_id, production_status
+        FROM controller_subscription_status
+       WHERE is_missing
+         AND activated = true
+         AND comm_types && ARRAY['ethernet', 'wifi', 'other']::varchar[]
+       ORDER BY unit_id;
+    `);
+
+    // ── 12. sync_runs —— 同步运行日志 ────────────────────────────────────────
     //
     // ⚠️ 用 CREATE TABLE IF NOT EXISTS，且**刻意不在第 2 节的 DROP 列表里**：
     //    这张表记的是运维历史，不是镜像数据。重建镜像表不该把同步历史一起清掉，

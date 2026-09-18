@@ -12,12 +12,12 @@
  * Column mapping:
  *   c.UnitId            → unit_id
  *   c.SerialNo          → serial_no
- *   c.SIMCardNo         → sim_card_no        (NOT NULL)
+ *   c.SIMCardNo         → sim_card_no / comm_types  （拆两列，见 deriveCommType）
  *   c.AccManagerId      → owner_user_id
  *   c.CompanyId         → company_id         设备自己的公司（"由哪家公司管理"）
  *   c.SystemID          → system_id          (NOT NULL)
- *   c.FirmwareVersion   → firmware_version
- *   c.ControllerModel   → model_type
+ *   c.FirmwareVersion   → system_type        (装的是设备功能类型 CT/PRO/SP，不是固件版本)
+ *   c.ControllerModel   → model_code         (去填充 / 大写 / 别名 / 占位文本→NULL)
  *   c.LinuxTimeZoneId   → timezone_id
  *   c.ProductionStatus  → production_status  (旧列名叫 "Status"，语义已正名)
  *   c.Activated         → activated
@@ -30,7 +30,7 @@
  *   c.CustPO            → po_number
  *   c.Serials           → spare_parts
  *   c.Notes             → notes
- *   —                   → sync_source        (建表 DEFAULT 'mssql'，不显式写)
+
  *
  * ✅ O2 / 台账 R-003 已修（2026-09-09）：
  *    company_id 改取 `c.CompanyId`（设备自己的公司），不再取 Owner 所属公司。
@@ -54,7 +54,7 @@ import dotenv from 'dotenv';
 import { Pool } from 'pg';
 import sql from 'mssql';
 import { startProgress } from './progress.js';
-import { parseTags, toBool } from './derive.js';
+import { deriveCommType, deriveControllerModel, nullIfBlank, parseTags, toBool } from './derive.js';
 import { getSqlServerConfig, getPostgresUrl } from './dbConfig.js';
 
 dotenv.config();
@@ -73,7 +73,7 @@ const { cfg: sqlConfig, srcDb: SRC_DB } = getSqlServerConfig();
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 /**
- * sim_card_no / system_id / created_at 在目标表上都是 NOT NULL，而源库对应列可空
+ * system_id / created_at 在目标表上是 NOT NULL，而源库对应列可空
  * （DateCreated 按 Prisma schema 是 NOT NULL，这里一并兜住，免得哪天源库放宽了约束
  *  就变成难查的运行时错误）。
  *
@@ -85,17 +85,18 @@ const { cfg: sqlConfig, srcDb: SRC_DB } = getSqlServerConfig();
  *    只有整列省略才会。2026-09-08 的排练就是在这里炸的。
  */
 function checkRequiredColumns(rows) {
-  const bad = rows.filter(
-    (r) => r.SIMCardNo == null || r.SystemID == null || r.DateCreated == null,
-  );
+  // ⚠️ SIMCardNo 曾经也在这里 —— 目标列 sim_card_no 改成可空后它不再是必填项。
+  //    它的值现在由 deriveCommType 拆进 sim_card_no / comm_types，
+  //    为空是合法的（= 通信方式 none）。
+  const bad = rows.filter((r) => r.SystemID == null || r.DateCreated == null);
   if (bad.length === 0) return;
 
-  console.error(`\n✗ ${bad.length} 台设备的 SIMCardNo / SystemID / DateCreated 为空，而目标列是 NOT NULL：`);
-  console.error('  UnitId\t\tSIMCardNo\t\tSystemID\t\tDateCreated');
+  console.error(`\n✗ ${bad.length} 台设备的 SystemID / DateCreated 为空，而目标列是 NOT NULL：`);
+  console.error('  UnitId\t\tSystemID\t\tDateCreated');
   console.error('  ' + '-'.repeat(72));
   for (const r of bad.slice(0, 50)) {
     console.error(
-      `  ${r.UnitId}\t\t${r.SIMCardNo ?? '<空>'}\t\t${r.SystemID ?? '<空>'}\t\t${r.DateCreated ?? '<空>'}`,
+      `  ${r.UnitId}\t\t${r.SystemID ?? '<空>'}\t\t${r.DateCreated ?? '<空>'}`,
     );
   }
   if (bad.length > 50) console.error(`  …还有 ${bad.length - 50} 行`);
@@ -163,16 +164,19 @@ async function migrateControllers(pgClient) {
   const progress = startProgress(rows.length, 'controllers  ');
 
   for (const row of rows) {
+    const comm = deriveCommType(row.SIMCardNo);
+
     await pgClient.query(
       `INSERT INTO controllers (
          unit_id,
          serial_no,
          sim_card_no,
+         comm_types,
          owner_user_id,
          company_id,
          system_id,
-         firmware_version,
-         model_type,
+         system_type,
+         model_code,
          timezone_id,
          production_status,
          activated,
@@ -186,16 +190,17 @@ async function migrateControllers(pgClient) {
          spare_parts,
          notes
        )
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`,
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)`,
       [
         row.UnitId,
         row.SerialNo         || null,
-        row.SIMCardNo,
+        comm.simCardNo,                                 // 只在真的填了卡号时有值
+        comm.commTypes,                                 // 数组：wifi / ethernet / sim / modem_no_sim / none / other
         row.AccManagerId     || null,                   // owner_user_id
         row.CompanyId        || null,                   // 设备自己的公司（R-003 已修）
         row.SystemID,
-        row.FirmwareVersion  || null,
-        row.ControllerModel  || null,                   // model_type
+        nullIfBlank(row.FirmwareVersion),               // system_type（旧名 FirmwareVersion）
+        deriveControllerModel(row.ControllerModel),     // model_code（去填充/大写/别名/占位→NULL）
         row.LinuxTimeZoneId  || null,                   // timezone_id
         row.ProductionStatus ?? null,                   // production_status
         toBool(row.Activated),

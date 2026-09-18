@@ -27,7 +27,7 @@
  *   LastLoginTime         → last_login_at
  *   DateCreated           → created_at
  *   LastUpdateDate        → updated_at           源列可空，空则回退 DateCreated
- *   —                     → sync_source          建表 DEFAULT 'mssql'
+
  *
  * ⚠️ 2026-09-09 按 David Grevell 的权限模型邮件重写，三处变化：
  *
