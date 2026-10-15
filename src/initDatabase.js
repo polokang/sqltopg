@@ -127,6 +127,11 @@ async function initDatabase() {
     //    controllers / user_controller_assignments 同理（不变式 I2，见 sync-simple.js）。
     //    ⚠️ 只存在于 PG、长期停在 'pro' 的行 = Pro 双写漏了权威库，由对账发现。
     //
+    // name / user_name —— 2026-10-15 拆开（project-docs 06 W2）：
+    //   name      显示名  ← UserInfomation.Name（回退 UserName → Email）
+    //   user_name 登录名  ← UserInfomation.UserName（老站按 CompanyId + UserName 登录，
+    //                       只在公司内唯一，所以这里不加 UNIQUE）
+    //
     // roles —— 只有 super / manager / operator 三个值，由 UserTypeId 派生（见
     //   src/derive.js 的 deriveRoles）。**没有 owner** —— Owner 是 per-controller
     //   的关系（controllers.owner_user_id），不是用户属性。
@@ -149,6 +154,7 @@ async function initDatabase() {
         mobile              VARCHAR(50)  DEFAULT '0000000000',
         mobile_verified     BOOLEAN      NOT NULL DEFAULT false,
         name                VARCHAR(100) NOT NULL,
+        user_name           VARCHAR(50),
         password_hash       VARCHAR(255) NOT NULL,
         avatar_url          VARCHAR(255),
         jw_code             VARCHAR(50),
@@ -167,6 +173,8 @@ async function initDatabase() {
     await client.query(`ALTER SEQUENCE users_user_id_seq OWNED BY users.user_id;`);
     await client.query(`CREATE INDEX ON users (company_id);`);
     await client.query(`CREATE INDEX ON users (activated);`);
+    // Pro 登录支持按老站登录名（UserName）查找
+    await client.query(`CREATE INDEX ON users (user_name);`);
     // 代码里到处 email.toLowerCase()，但上面的 UNIQUE 是大小写敏感的
     await client.query(`CREATE UNIQUE INDEX users_email_lower_idx ON users (lower(email));`);
     // Manager 路径判定 (company_id = ANY(managed_company_ids)) 每次列表查询都要跑

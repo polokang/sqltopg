@@ -101,20 +101,21 @@ WHERE (companies.name, companies.phone, companies.email,
 export const UPSERT_USERS = `
 INSERT INTO users (
   user_id, company_id, email, email_verified, mobile, mobile_verified,
-  name, password_hash, avatar_url, jw_code,
+  name, user_name, password_hash, avatar_url, jw_code,
   roles, managed_company_ids, activated, mfa_enabled,
   last_login_at, created_at, updated_at
 )
 SELECT
   x.user_id, x.company_id, x.email, x.email_verified, x.mobile, x.mobile_verified,
-  x.name, x.password_hash, x.avatar_url, x.jw_code,
+  x.name, x.user_name, x.password_hash, x.avatar_url, x.jw_code,
   ARRAY(SELECT jsonb_array_elements_text(x.roles))::varchar[],
   ARRAY(SELECT jsonb_array_elements_text(x.managed_company_ids)::int),
   x.activated, x.mfa_enabled,
   x.last_login_at, x.created_at, x.updated_at
   FROM jsonb_to_recordset($1::jsonb) AS x(
     user_id int, company_id int, email varchar, email_verified boolean,
-    mobile varchar, mobile_verified boolean, name varchar, password_hash varchar,
+    mobile varchar, mobile_verified boolean, name varchar, user_name varchar,
+    password_hash varchar,
     avatar_url varchar, jw_code varchar,
     roles jsonb, managed_company_ids jsonb,
     activated boolean, mfa_enabled boolean,
@@ -127,6 +128,7 @@ ON CONFLICT (user_id) DO UPDATE SET
   mobile          = EXCLUDED.mobile,
   mobile_verified = EXCLUDED.mobile_verified,
   name            = EXCLUDED.name,
+  user_name       = EXCLUDED.user_name,
   password_hash   = EXCLUDED.password_hash,
   jw_code         = EXCLUDED.jw_code,
   roles           = EXCLUDED.roles,
@@ -137,12 +139,12 @@ ON CONFLICT (user_id) DO UPDATE SET
   sync_source     = 'mssql'
 WHERE users.sync_source <> 'mssql'
    OR (users.company_id, users.email, users.email_verified, users.mobile,
-       users.mobile_verified, users.name, users.password_hash,
+       users.mobile_verified, users.name, users.user_name, users.password_hash,
        users.jw_code, users.roles, users.activated, users.mfa_enabled,
        users.last_login_at, users.updated_at)
   IS DISTINCT FROM
       (EXCLUDED.company_id, EXCLUDED.email, EXCLUDED.email_verified, EXCLUDED.mobile,
-       EXCLUDED.mobile_verified, EXCLUDED.name, EXCLUDED.password_hash,
+       EXCLUDED.mobile_verified, EXCLUDED.name, EXCLUDED.user_name, EXCLUDED.password_hash,
        EXCLUDED.jw_code, EXCLUDED.roles, EXCLUDED.activated, EXCLUDED.mfa_enabled,
        GREATEST(users.last_login_at, EXCLUDED.last_login_at), EXCLUDED.updated_at)
 `;

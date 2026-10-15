@@ -472,7 +472,7 @@ const OPERATION_FIELD_RENAMES = {
     },
     user: {
         UserId: 'user_id', CompanyId: 'company_id', Email: 'email', Mobile: 'mobile',
-        IsPhoneVerified: 'mobile_verified', UserName: 'name',
+        IsPhoneVerified: 'mobile_verified', UserName: 'user_name', Name: 'name',
         PasswordHash: 'password_hash', Logo: 'avatar_url', JWCode: 'jw_code',
         UserTypeId: 'roles', Activated: 'activated',
         RequiresTwoFactorAuth: 'mfa_enabled', LastLoginTime: 'last_login_at',
@@ -811,8 +811,19 @@ export function mapPermission(accessLevel) {
     return accessLevel === 0 ? PERMISSION.READONLY : PERMISSION.NORMAL;
 }
 
-/** users.name 的回退链：UserName → Name → Email */
-export const deriveUserName = (row) => row.UserName || row.Name || row.Email;
+/**
+ * users.name —— **显示名**，取 UserInfomation.Name（回退 UserName → Email）。
+ *
+ * 2026-10-15 前是 UserName 优先，结果 Pro 改了显示名（写老库 Name）会被同步改回
+ * UserName（project-docs 06 W2）。老站里两者语义不同：Name 是显示名，UserName 是
+ * 登录名（老站按 CompanyId + UserName 登录，LoginController.cs:303），后者现在单独
+ * 进 users.user_name。
+ */
+export const deriveDisplayName = (row) =>
+    nullIfBlank(row.Name) ?? nullIfBlank(row.UserName) ?? row.Email;
+
+/** users.user_name ← UserInfomation.UserName（老站登录名，公司内唯一，可空）。 */
+export const deriveLoginName = (row) => nullIfBlank(row.UserName);
 
 /** users.mobile 的默认值，与老站 ControllerController.AddUser 一致。 */
 export const deriveMobile = (mobile) => nullIfBlank(mobile) ?? '0000000000';

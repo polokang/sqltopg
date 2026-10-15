@@ -16,7 +16,8 @@
  *   Activated=1           → email_verified
  *   Mobile                → mobile               空则 '0000000000'
  *   IsPhoneVerified       → mobile_verified
- *   UserName→Name→Email   → name
+ *   Name→UserName→Email   → name                 显示名（derive.deriveDisplayName）
+ *   UserName              → user_name            老站登录名
  *   PasswordHash          → password_hash
  *   Logo                  → **不迁**。老库 Logo 是公司 logo（→ companies.logo_url），avatar_url 是 Pro 独有、初始 NULL
  *   JWCode                → jw_code         🆕
@@ -58,7 +59,8 @@ import {
   deriveRoles,
   deriveManagedCompanyIds,
   deriveJwCode,
-  deriveUserName,
+  deriveDisplayName,
+  deriveLoginName,
   deriveMobile,
   dedupeUsersByEmail,
   toBool,
@@ -148,6 +150,7 @@ async function migrateUsers(pgClient) {
          mobile,
          mobile_verified,
          name,
+         user_name,
          password_hash,
          avatar_url,
          jw_code,
@@ -159,7 +162,7 @@ async function migrateUsers(pgClient) {
          created_at,
          updated_at
        )
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
       [
         row.UserId,
         row.CompanyId,
@@ -167,7 +170,8 @@ async function migrateUsers(pgClient) {
         toBool(row.Activated),                    // email_verified
         deriveMobile(row.Mobile),
         toBool(row.IsPhoneVerified),              // mobile_verified
-        deriveUserName(row),                      // name
+        deriveDisplayName(row),                   // name（显示名）
+        deriveLoginName(row),                     // user_name（老站登录名）
         row.PasswordHash || '',
         null,                                     // avatar_url（Pro 独有，Q18）
         deriveJwCode(row.JWCode),                 // jw_code

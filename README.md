@@ -48,7 +48,7 @@ docker-compose.yml           # 生产部署（镜像 adminpage.azurecr.io/sqltop
 | 表 | 数据源 | 说明 |
 |---|---|---|
 | `companies` | `dbo.CompanyInfomation` | 公司（用真名 `CompanyName`）。**没有 `jw_code`**。`logo_url` 优先取该公司 Owner（`Production=1`）用户的 `UserInfomation.Logo`，再回退 `CompanyLogoName`（`derive.deriveCompanyLogo`） |
-| `users` | `dbo.UserInfomation` | `roles` 由 `UserTypeId` 派生；`jw_code` ← `JWCode`；`managed_company_ids`、`avatar_url` 是 Pro 独有数据，`last_login_at` 取两边较晚值（见约定 ④） |
+| `users` | `dbo.UserInfomation` | `name` ← `Name`（显示名），`user_name` ← `UserName`（老站登录名）；`roles` 由 `UserTypeId` 派生；`jw_code` ← `JWCode`；`managed_company_ids`、`avatar_url` 是 Pro 独有数据，`last_login_at` 取两边较晚值（见约定 ④） |
 | `controllers` | `dbo.ControllerInfo` | `company_id` 取**设备自己的** `CompanyId`；`billing_email` 取 Owner（`AccManagerId`）的 `Email`，派生值（R-004） |
 | `user_controller_assignments` | `dbo.UserControllerAssignment` | 按 `(user_id, unit_id)` 自然键；`permission` 见下 |
 | `user_identities` | **无**（Pro 自有） | Passkey / Google 绑定，不同步 |
@@ -253,6 +253,7 @@ psql "$POSTGRESQL_URL" -v ON_ERROR_STOP=1 -f migrations/<文件>.sql
 | `001_rename_to_snake_case.sql` | 旧 PascalCase schema 改名为 snake_case（历史） |
 | `004_admin_notes_and_operation_logs.sql` | `creator` / `accessory_serial_numbers` 改名、`admin_controller_notes`、`admin_operation_logs`、`paid_by_user_id` |
 | `005_sync_source_users_controllers.sql` | `users` / `controllers` 加回 `sync_source`（修同步竞态）。**部署新版同步服务前先跑** |
+| `007_users_user_name.sql` | `users` 新增 `user_name`（老站登录名），`name` 改为显示名；对齐 `admin_operation_logs` 历史字段名。**部署新版同步服务前先跑** |
 | `006_avatar_and_last_login.sql` | 清掉历史上从 `Logo` 灌进来的 `avatar_url`、按旧口径（快 10 小时）存的 `last_login_at`。**部署新版同步服务后、Pro 上线前跑一次** |
 | `archive/` | 已被 `initDatabase.js` 取代的历史脚本，**不要执行**（002 删 `sync_source` 的决定已被 005 反转） |
 
