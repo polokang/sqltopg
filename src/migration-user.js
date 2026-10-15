@@ -18,13 +18,13 @@
  *   IsPhoneVerified       → mobile_verified
  *   UserName→Name→Email   → name
  *   PasswordHash          → password_hash
- *   Logo                  → avatar_url
+ *   Logo                  → **不迁**。老库 Logo 是公司 logo（→ companies.logo_url），avatar_url 是 Pro 独有、初始 NULL
  *   JWCode                → jw_code         🆕
  *   UserTypeId            → roles                见 derive.deriveRoles
  *   UserTypeId+CompanyId  → managed_company_ids  见 derive.deriveManagedCompanyIds
  *   Activated             → activated
  *   RequiresTwoFactorAuth → mfa_enabled
- *   LastLoginTime         → last_login_at
+ *   LastLoginTime         → last_login_at        墙上时间换算成真时刻（derive.wallClockToInstant）
  *   DateCreated           → created_at
  *   LastUpdateDate        → updated_at           源列可空，空则回退 DateCreated
 
@@ -62,6 +62,7 @@ import {
   deriveMobile,
   dedupeUsersByEmail,
   toBool,
+  wallClockToInstant,
 } from './derive.js';
 import { getSqlServerConfig, getPostgresUrl } from './dbConfig.js';
 
@@ -168,13 +169,13 @@ async function migrateUsers(pgClient) {
         toBool(row.IsPhoneVerified),              // mobile_verified
         deriveUserName(row),                      // name
         row.PasswordHash || '',
-        row.Logo || null,                         // avatar_url
+        null,                                     // avatar_url（Pro 独有，Q18）
         deriveJwCode(row.JWCode),                 // jw_code
         roles,
         managedCompanyIds,
         toBool(row.Activated),
         toBool(row.RequiresTwoFactorAuth),        // mfa_enabled
-        row.LastLoginTime || null,                // last_login_at
+        wallClockToInstant(row.LastLoginTime),    // last_login_at（墙上时间 → 真时刻）
         row.DateCreated,                          // created_at
         row.LastUpdateDate,                       // updated_at（SELECT 里已 COALESCE）
       ],

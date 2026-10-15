@@ -1,7 +1,7 @@
 import dotenv from 'dotenv';
 import http from 'http';
 import { syncAllTables, pgPool } from './sync-simple.js';
-import { reapStaleRuns, recentRuns } from './syncLog.js';
+import { pruneOldRuns, reapStaleRuns, recentRuns } from './syncLog.js';
 
 dotenv.config();
 
@@ -16,14 +16,15 @@ const PORT = process.env.PORT || 3000;
 //   SYNC_INTERVAL_MINUTES > 0   → **按间隔**：每 N 分钟跑一次，
 //                                 SYNC_AT_HOUR / SYNC_TIMEZONE 不再参与调度
 //
-// ⚠️ 间隔模式有 5 分钟下限。低于下限会被提升到 5 并告警 —— 不是拍脑袋定的：
-//    2026-09-09 实测（本机 → Azure PG）单轮约 2 秒（1.5 秒读源库 + 批量写），
-//    5 分钟留了两个数量级的余量。真要更密，先把单轮耗时测出来再说。
+// ⚠️ 间隔模式有 1 分钟下限，低于下限会被提升并告警。
+//    2026-09-09 实测（本机 → Azure PG）单轮约 2 秒（1.5 秒读源库 + 批量写）。
+//    方案 A 定为每 2 分钟（2026-10-14，见 project-docs/common/migration 04 Q6/Q13；
+//    下限原为 5 分钟）。调密之后看 sync_runs.duration_ms，单轮明显变长再放宽。
 //    另外 performSync() 有 isRunning 保护，上一轮没跑完不会重入。
 //
 // ⚠️ 间隔模式改变了双写的自愈窗口。docs/migration/04、06 的不变式 I2
 //    （"mirror 失败只记日志，靠同步自愈"）里，自愈延迟 = 本间隔。
-//    每天一次 = 最长 24 小时；设成 5~15 分钟就回到接近原先的水平。
+//    每天一次 = 最长 24 小时；每 2 分钟 = 最长约 2 分钟。
 //    见台账 R-213。
 //
 // Australia/Brisbane 全年 UTC+10（昆士兰不实行夏令时），所以每天定时模式不存在
@@ -31,11 +32,13 @@ const PORT = process.env.PORT || 3000;
 // 万一将来昆州改了政策也不用动代码。
 const SYNC_TIMEZONE = process.env.SYNC_TIMEZONE || 'Australia/Brisbane';
 const SYNC_AT_HOUR = Number(process.env.SYNC_AT_HOUR ?? 0); // 0 = 午夜
+// sync_runs 保留天数（<= 0 不清理）。每 2 分钟一行，一年约 26 万行。
+const SYNC_RUNS_RETENTION_DAYS = Number(process.env.SYNC_RUNS_RETENTION_DAYS ?? 90);
 // 启动时是否立刻补一次（默认是：部署完不用等到下一个周期才知道能不能跑通）
 const SYNC_ON_STARTUP = process.env.SYNC_ON_STARTUP !== 'false';
 
 /** 间隔模式的下限（分钟）。 */
-const MIN_INTERVAL_MINUTES = 5;
+const MIN_INTERVAL_MINUTES = 1;
 
 /**
  * 解析 SYNC_INTERVAL_MINUTES，决定调度模式。
@@ -150,6 +153,7 @@ async function performSync(triggerSource = 'scheduled') {
     console.error(`[${new Date().toISOString()}] ✗ 同步任务失败:`, error.message);
   } finally {
     syncStatus.isRunning = false;
+    await pruneOldRuns(pgPool, SYNC_RUNS_RETENTION_DAYS);
   }
 }
 
@@ -219,6 +223,7 @@ async function startScheduledSync() {
   // 清理上一轮进程被杀 / 崩溃后遗留的 'running' 记录，否则监控里会一直
   // 看到"有一次同步在跑"
   await reapStaleRuns(pgPool);
+  await pruneOldRuns(pgPool, SYNC_RUNS_RETENTION_DAYS);
 
   if (SYNC_ON_STARTUP) {
     console.log('\n执行启动时同步...');

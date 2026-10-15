@@ -23,13 +23,14 @@
  *   c.Activated         → activated
  *   c.DateCreated       → created_at         (NOT NULL)
  *   c.DateLastUpdate    → updated_at         (NOT NULL；源列可空，空则回退到 DateCreated)
- *   c.SiteLocation      → site_location      (旧列名叫 "Creator"，语义已正名)
+ *   c.SiteLocation      → creator            (⚠️ 装的是建档人 Andrew/Vish/…，不是站点位置)
  *   c.Suburb            → tags               (按 "," 拆成数组)
  *   u.Email             → billing_email      ⚠️ 派生值，源库没有这一列（O3）
  *   c.Barcode           → bar_code
  *   c.CustPO            → po_number
- *   c.Serials           → spare_parts
- *   c.Notes             → notes
+ *   c.Serials           → accessory_serial_numbers (按空白/逗号切成数组)
+ *   c.Notes             → **不进 controllers** —— 按 '-->' 拆进 admin_controller_notes，
+ *                          由 sync-simple.js 的 syncAdminRecords 负责（见 derive.parseControllerNotes）
 
  *
  * ✅ O2 / 台账 R-003 已修（2026-09-09）：
@@ -54,7 +55,7 @@ import dotenv from 'dotenv';
 import { Pool } from 'pg';
 import sql from 'mssql';
 import { startProgress } from './progress.js';
-import { deriveCommType, deriveControllerModel, nullIfBlank, parseTags, toBool } from './derive.js';
+import { deriveCommType, deriveControllerModel, nullIfBlank, parseSerials, parseTags, toBool } from './derive.js';
 import { getSqlServerConfig, getPostgresUrl } from './dbConfig.js';
 
 dotenv.config();
@@ -133,8 +134,7 @@ async function migrateControllers(pgClient) {
       u.[Email]     AS BillingEmail,
       c.[Barcode],
       c.[CustPO],
-      c.[Serials],
-      c.[Notes]
+      c.[Serials]
     FROM  ${SRC_DB}.dbo.ControllerInfo     c
     LEFT JOIN ${SRC_DB}.dbo.UserInfomation u
            ON u.[UserId] = c.[AccManagerId]
@@ -182,15 +182,14 @@ async function migrateControllers(pgClient) {
          activated,
          created_at,
          updated_at,
-         site_location,
+         creator,
          tags,
          billing_email,
          bar_code,
          po_number,
-         spare_parts,
-         notes
+         accessory_serial_numbers
        )
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)`,
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`,
       [
         row.UnitId,
         row.SerialNo         || null,
@@ -206,13 +205,12 @@ async function migrateControllers(pgClient) {
         toBool(row.Activated),
         row.DateCreated,                                // created_at（NOT NULL，已在前置检查兜住）
         row.DateLastUpdate || row.DateCreated,          // updated_at（NOT NULL，源列可空则回退）
-        row.SiteLocation     || null,                   // site_location
+        nullIfBlank(row.SiteLocation),                  // creator（建档人，不是站点位置）
         parseTags(row.Suburb),                          // tags
         row.BillingEmail     || null,                   // billing_email（派生，见 O3）
         row.Barcode          || null,                   // bar_code
         row.CustPO           || null,                   // po_number
-        row.Serials          || null,                   // spare_parts
-        row.Notes            || null,
+        parseSerials(row.Serials),                      // accessory_serial_numbers（按空白/逗号切成数组）
       ],
     );
     inserted++;

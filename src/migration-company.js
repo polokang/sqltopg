@@ -14,7 +14,7 @@
  *   CompanyName     → name              (真名)
  *   Phone           → phone
  *   Email           → email
- *   CompanyLogoName → logo_url
+ *   CompanyLogoName → logo_url          (优先取 Owner 用户的 UserInfomation.Logo，见 derive.deriveCompanyLogo)
  *   Activated       → activated
  *   DateCreated     → created_at
  *   LastUpdateDate  → updated_at        (源列可空，空则回退 DateCreated)
@@ -44,7 +44,7 @@ import dotenv from 'dotenv';
 import { Pool } from 'pg';
 import sql from 'mssql';
 import { startProgress } from './progress.js';
-import { USER_TYPE, toBool, nullIfBlank } from './derive.js';
+import { USER_TYPE, toBool, nullIfBlank, deriveCompanyLogo, DEFAULT_LOGO } from './derive.js';
 import { getSqlServerConfig, getPostgresUrl } from './dbConfig.js';
 
 dotenv.config();
@@ -115,7 +115,8 @@ async function migrateCompanies(pgClient) {
       c.Activated,
       c.DateCreated,
       c.LastUpdateDate,
-      m.UserId AS ManagerUserId
+      m.UserId AS ManagerUserId,
+      o.Logo AS OwnerLogo
     FROM ${SRC_DB}.dbo.CompanyInfomation c
     OUTER APPLY (
       SELECT TOP 1 u.UserId
@@ -125,6 +126,17 @@ async function migrateCompanies(pgClient) {
          AND u.Email IS NOT NULL
        ORDER BY u.UserId
     ) m
+    -- 公司 logo 优先取 Owner（Production=1）用户的 Logo，见 derive.deriveCompanyLogo。
+    -- 多个候选时取最近更新的；与 sync-simple.js 的同一段保持一致。
+    OUTER APPLY (
+      SELECT TOP 1 u.Logo, COUNT(*) OVER () AS Candidates
+        FROM ${SRC_DB}.dbo.UserInfomation u
+       WHERE u.CompanyId = c.CompanyId
+         AND u.Production = 1
+         AND NULLIF(LTRIM(RTRIM(u.Logo)), '') IS NOT NULL
+         AND u.Logo <> '${DEFAULT_LOGO}'
+       ORDER BY COALESCE(u.LastUpdateDate, u.DateCreated) DESC, u.UserId
+    ) o
     ORDER BY c.CompanyId
   `);
 
@@ -164,7 +176,7 @@ async function migrateCompanies(pgClient) {
         row.ManagerUserId ?? null,                            // manager_user_id
         nullIfBlank(row.Phone),                               // phone
         nullIfBlank(row.Email),                               // email
-        nullIfBlank(row.CompanyLogoName) ?? 'YourLogoGoesToHere.JPG',
+        deriveCompanyLogo(row.OwnerLogo, row.CompanyLogoName), // logo_url
         toBool(row.Activated),                                // activated
         row.DateCreated,                                      // created_at
         row.LastUpdateDate || row.DateCreated,                // updated_at（源列可空）

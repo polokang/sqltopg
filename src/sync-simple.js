@@ -2,13 +2,18 @@
  * sync-simple.js
  *
  * 常驻增量同步：SQL Server (AquariusEmailDB) → PostgreSQL (AquariusPG)。
- * 由 index.js 每天布里斯班时间 00:00 调用一次（2026-09-09 前是每 2 分钟）。
+ * 由 index.js 按 SYNC_INTERVAL_MINUTES 调度（方案 A 定为每 2 分钟；0 = 每天定时一次）。
  *
  * 同步的表（snake_case，见 src/initDatabase.js）：
  *   companies                   ← dbo.CompanyInfomation
  *   users                       ← dbo.UserInfomation
  *   controllers                 ← dbo.ControllerInfo（LEFT JOIN UserInfomation 取 billing_email）
  *   user_controller_assignments ← dbo.UserControllerAssignment
+ *   controller_service_logs     ← dbo.ControllerNotes（面向客户）
+ *   controller_service_tasks    ← dbo.ControllerInfo.Action（面向客户）
+ *   controller_subscriptions    ← dbo.ControllerInfo.RenewalInv/RenewalDate（kind='legacy'）
+ *   admin_controller_notes      ← dbo.ControllerInfo.Notes（按 '-->' 拆行，**仅内部**）
+ *   admin_operation_logs        ← dbo.OperationLog（增量，**仅内部**）
  *
  * 不同步（Pro 自有数据，SQL Server 没有对应表/字段）：
  *   user_identities            Passkey / Google 绑定
@@ -25,10 +30,13 @@
  *    2 分钟翻来翻去、且极难排查。规则只允许写在 derive.js 里，两边 import 同一个
  *    函数 —— 历史上这两边的邮箱去重逻辑就已经漂过（sync 保留一行，migration 中止）。
  *
- * I2 **只有 user_controller_assignments 上还有 sync_source，孤儿清理只删该表的 'mssql' 行。**
- *    users / controllers 已去掉这一列 —— 两张表整表来自 SQL Server，没有 Pro 自建行。
- *    双写期 Pro 会往 PG 写 sync_source='pro' 的行（例如给 Manager 存告警偏好），
- *    这些行在 SQL Server 里没有对应记录，无条件清理会把它们静默删掉。（台账 R-008）
+ * I2 **users / controllers / user_controller_assignments 的孤儿清理只删 sync_source='mssql' 的行；
+ *    UPSERT 命中时把 sync_source 改回 'mssql'。**
+ *    Pro 双写写进 PG 的行标 'pro'，保护两类行不被误删：
+ *      · 竞态：Pro 在本轮"读快照"之后才写进 SQL Server 的行，不在快照里；
+ *      · 只存在于 PG 的授权行（例如给 Manager 存告警偏好，台账 R-008）。
+ *    下一轮快照里有了它，UPSERT 就把它"收编"为 'mssql'，此后源库删了它才会被清理。
+ *    （2026-10-14 方案 A 阶段 0.2：users / controllers 重新加回此列。）
  *
  * I3 **users.managed_company_ids 永不被覆盖。**
  *    SQL Server 没有这个字段。初值由 derive.deriveManagedCompanyIds 给
@@ -64,17 +72,32 @@ import {
   parseTags,
   deriveCommType,
   deriveControllerModel,
+  classifySerials,
+  parseNoteDate,
+  parseControllerNotes,
+  deriveOperationLogRows,
+  deriveNoteAuthors,
+  utcInstantToBrisbaneDate,
+  wallClockToDate,
+  CASH_ACCOUNT_USER_ID,
   toBool,
   nullIfBlank,
+  deriveCompanyLogo,
+  DEFAULT_LOGO,
+  wallClockToInstant,
 } from './derive.js';
 import { getSqlServerConfig, getPostgresUrl } from './dbConfig.js';
 import { startRun, finishRun } from './syncLog.js';
 import {
   upsertChunked,
+  CHUNK_SIZE,
   UPSERT_COMPANIES,
   UPSERT_USERS,
   UPSERT_CONTROLLERS,
   UPSERT_ASSIGNMENTS,
+  UPSERT_ADMIN_CONTROLLER_NOTES,
+  PRUNE_ADMIN_CONTROLLER_NOTES,
+  UPSERT_ADMIN_OPERATION_LOGS,
 } from './upserts.js';
 
 dotenv.config();
@@ -102,7 +125,8 @@ async function syncCompanies(pgClient, mssqlPool) {
       c.CompanyId, c.CompanyName, c.Phone, c.Email, c.CompanyLogoName,
       c.Activated, c.DateCreated,
       COALESCE(c.LastUpdateDate, c.DateCreated) AS LastUpdateDate,
-      m.UserId AS ManagerUserId
+      m.UserId AS ManagerUserId,
+      o.Logo AS OwnerLogo, o.Candidates AS OwnerLogoCandidates
     FROM ${SRC_DB}.dbo.CompanyInfomation c
     OUTER APPLY (
       SELECT TOP 1 u.UserId
@@ -112,6 +136,17 @@ async function syncCompanies(pgClient, mssqlPool) {
          AND u.Email IS NOT NULL
        ORDER BY u.UserId
     ) m
+    -- 公司 logo 优先取 Owner（Production=1）用户的 Logo，见 derive.deriveCompanyLogo。
+    -- 多个候选时取最近更新的；与 migration-company.js 的同一段保持一致。
+    OUTER APPLY (
+      SELECT TOP 1 u.Logo, COUNT(*) OVER () AS Candidates
+        FROM ${SRC_DB}.dbo.UserInfomation u
+       WHERE u.CompanyId = c.CompanyId
+         AND u.Production = 1
+         AND NULLIF(LTRIM(RTRIM(u.Logo)), '') IS NOT NULL
+         AND u.Logo <> '${DEFAULT_LOGO}'
+       ORDER BY COALESCE(u.LastUpdateDate, u.DateCreated) DESC, u.UserId
+    ) o
   `);
 
   const rows = result.recordset;
@@ -122,18 +157,20 @@ async function syncCompanies(pgClient, mssqlPool) {
   // 等 syncUsers 跑完再由 backfillCompanyManagers 回填。
   const pendingManagers = [];
   const validCompanyIds = new Set();
+  const multiOwnerLogo = [];   // 有多个 Owner 候选 logo 的公司，取了最近更新的那个
 
   const payload = rows.map((row) => {
     if (row.ManagerUserId != null) {
       pendingManagers.push({ companyId: row.CompanyId, managerUserId: row.ManagerUserId });
     }
     validCompanyIds.add(row.CompanyId);
+    if (row.OwnerLogoCandidates > 1) multiOwnerLogo.push(row.CompanyId);
     return {
       company_id: row.CompanyId,
       name:       String(row.CompanyName).trim(),
       phone:      nullIfBlank(row.Phone),
       email:      nullIfBlank(row.Email),
-      logo_url:   nullIfBlank(row.CompanyLogoName) ?? 'YourLogoGoesToHere.JPG',
+      logo_url:   deriveCompanyLogo(row.OwnerLogo, row.CompanyLogoName),
       activated:  toBool(row.Activated),
       created_at: row.DateCreated,
       updated_at: row.LastUpdateDate,
@@ -146,6 +183,9 @@ async function syncCompanies(pgClient, mssqlPool) {
   //    而且删公司会经 controllers.company_id 的 ON DELETE SET NULL 让整批设备失去
   //    归属（也就失去全部 Manager 可见性），代价远大于收益。老站删公司走人工处理。
   console.log(`  实际写入 ${upserted} / ${rows.length} 行（未变化的行不写；companies 不做孤儿清理）`);
+  if (multiOwnerLogo.length > 0) {
+    console.log(`  ℹ ${multiOwnerLogo.length} 家公司有多个 Owner logo 候选，取最近更新的：${multiOwnerLogo.join(', ')}`);
+  }
   return {
     validCompanyIds,
     pendingManagers,
@@ -180,7 +220,7 @@ async function syncUsers(pgClient, mssqlPool) {
   const result = await mssqlPool.request().query(`
     SELECT
       UserId, CompanyId, UserTypeId, Mobile, IsPhoneVerified, Email,
-      UserName, Name, PasswordHash, Logo, JWCode,
+      UserName, Name, PasswordHash, JWCode,
       Activated, RequiresTwoFactorAuth,
       LastLoginTime, DateCreated,
       COALESCE(LastUpdateDate, DateCreated) AS LastUpdateDate
@@ -192,6 +232,9 @@ async function syncUsers(pgClient, mssqlPool) {
   console.log(`  Read ${result.recordset.length} source rows → ${rows.length} after email dedup`);
   if (dropped.length > 0) {
     console.warn(`  ⚠ ${dropped.length} 组重复邮箱已去重（保留 Activated > CorporateManager > 较大 UserId）`);
+    for (const d of dropped) {
+      console.warn(`      ${d.email}  保留 UserId=${d.keptUserId}，丢弃 UserId=${d.droppedUserId}`);
+    }
   }
 
   const validUserIds = new Set();
@@ -207,14 +250,16 @@ async function syncUsers(pgClient, mssqlPool) {
       mobile_verified:     toBool(row.IsPhoneVerified),
       name:                deriveUserName(row),
       password_hash:       row.PasswordHash || '',
-      avatar_url:          row.Logo || null,
+      // Pro 独有（Q18）：老库 Logo 是公司 logo 不是头像。仅 INSERT 生效（给 NULL），DO UPDATE 不含此列
+      avatar_url:          null,
       jw_code:             deriveJwCode(row.JWCode),
       roles:               deriveRoles(row.UserTypeId),
       // 仅 INSERT 时生效 —— 不变式 I3，UPSERT_USERS 的 DO UPDATE 不含此列
       managed_company_ids: deriveManagedCompanyIds(row.UserTypeId, row.CompanyId),
       activated:           toBool(row.Activated),
       mfa_enabled:         toBool(row.RequiresTwoFactorAuth),
-      last_login_at:       row.LastLoginTime || null,
+      // 墙上时间 → 真时刻；UPSERT 取与 PG 现值较晚者（Q19，Pro 登录只写 PG）
+      last_login_at:       wallClockToInstant(row.LastLoginTime),
       created_at:          row.DateCreated,
       updated_at:          row.LastUpdateDate,
     };
@@ -222,11 +267,11 @@ async function syncUsers(pgClient, mssqlPool) {
 
   const upserted = await upsertChunked(pgClient, UPSERT_USERS, payload);
 
-  // 孤儿清理：删掉源库里已经不存在的行。
-  // users 上不再有 sync_source —— 这张表整表来自 SQL Server，没有 Pro 自建的行。
+  // 孤儿清理：删掉源库里已经不存在的行。只删 'mssql' 行（不变式 I2）。
   const del = await pgClient.query(
     `DELETE FROM users
-      WHERE user_id <> ALL($1::int[])`,
+      WHERE sync_source = 'mssql'
+        AND user_id <> ALL($1::int[])`,
     [[...validUserIds]],
   );
   console.log(`  实际写入 ${upserted} / ${rows.length} 行，清理 ${del.rowCount} 条陈旧记录`);
@@ -263,6 +308,7 @@ async function syncControllers(pgClient, mssqlPool, validUserIds, validCompanyId
   const validUnitIds = new Set();
   let nulledOwner = 0;
   let nulledCompany = 0;
+  const serialNoteUnits = [];   // Serials 被当成备注（不是序列号清单）的设备
 
   const payload = rows.map((row) => {
     // 外键目标不在 PG 时置 NULL，而不是让整轮同步失败
@@ -273,6 +319,10 @@ async function syncControllers(pgClient, mssqlPool, validUserIds, validCompanyId
     if (companyId != null && !validCompanyIds.has(companyId)) { companyId = null; nulledCompany++; }
 
     validUnitIds.add(row.UnitId);
+
+    // Serials 里写的是整句备注而不是序列号清单，整段保留并记下来
+    const serials = classifySerials(row.Serials);
+    if (serials.isNote) serialNoteUnits.push(row.UnitId);
 
     // SIMCardNo 一列拆三列：通信方式 / 真卡号 / 原始串（见 derive.js）
     const comm = deriveCommType(row.SIMCardNo);
@@ -292,22 +342,22 @@ async function syncControllers(pgClient, mssqlPool, validUserIds, validCompanyId
       activated:         toBool(row.Activated),
       created_at:        row.DateCreated,
       updated_at:        row.DateLastUpdate,
-      site_location:     row.SiteLocation || null,
+      creator:           nullIfBlank(row.SiteLocation),
       tags:              parseTags(row.Suburb),
       billing_email:     row.BillingEmail || null,
       bar_code:          row.Barcode || null,
       po_number:         row.CustPO || null,
-      spare_parts:       row.Serials || null,
-      notes:             row.Notes || null,
+      accessory_serial_numbers: serials.values,
     };
   });
 
   const upserted = await upsertChunked(pgClient, UPSERT_CONTROLLERS, payload);
 
-  // controllers 同样不再有 sync_source（理由见 users 处）。
+  // 只删 'mssql' 行（不变式 I2）。
   const del = await pgClient.query(
     `DELETE FROM controllers
-      WHERE unit_id <> ALL($1::int[])`,
+      WHERE sync_source = 'mssql'
+        AND unit_id <> ALL($1::int[])`,
     [[...validUnitIds]],
   );
   console.log(
@@ -316,6 +366,11 @@ async function syncControllers(pgClient, mssqlPool, validUserIds, validCompanyId
       ? `（owner 置空 ${nulledOwner}、company 置空 ${nulledCompany}）`
       : ''),
   );
+  if (serialNoteUnits.length > 0) {
+    console.warn(
+      `  ⚠ ${serialNoteUnits.length} 台设备的 Serials 写的是备注而非序列号清单，已整段保留：`);
+    console.warn('      ' + serialNoteUnits.join(', '));
+  }
   return {
     validUnitIds,
     stats: {
@@ -392,6 +447,250 @@ async function syncAssignments(pgClient, mssqlPool, validUserIds, validUnitIds) 
  * @param {object}  [opts]
  * @param {'scheduled'|'startup'|'manual'} [opts.triggerSource] 记进日志的触发来源
  */
+/**
+ * 服务记录：ControllerNotes / ControllerInfo.Action / ControllerInfo.Renewal*
+ *
+ * ── 为什么这些也要每轮同步 ──────────────────────────────────────────────────
+ *
+ * 一度以为它们是一次性迁移，其实不是：旧站还在跑，服务工程师每天都在往
+ * ControllerNotes 里写（2026-09-16 还有新记录）。只要旧站不停，它们就是活的源，
+ * 和 users / controllers 一样要持续镜像。
+ *
+ * ── 键与冲突处理 ────────────────────────────────────────────────────────────
+ *
+ * 用 (source, source_id) 作自然键：
+ *   controller_service_logs   source_id = ControllerNotes.ID
+ *   controller_service_tasks  source_id = UnitId（Action 是覆盖写，每台最多一条）
+ *
+ * 应用自己新建的记录 source='manual' 且 source_id 为 NULL，落不进这个偏唯一索引，
+ * **永远不会被同步动到**。
+ */
+async function syncServiceRecords(pgClient, mssqlPool) {
+  console.log('=== Syncing service records ===');
+  const stats = {};
+
+  // ── ControllerNotes → controller_service_logs ──────────────────────────
+  const notes = (await mssqlPool.request().query(`
+    SELECT ID, UnitId, UserId, Notes, DateCreated
+      FROM ${SRC_DB}.dbo.ControllerNotes ORDER BY ID`)).recordset;
+
+  let logsW = 0;
+  let logsBlank = 0;
+  for (const r of notes) {
+    const body = nullIfBlank(r.Notes);
+    if (!body) { logsBlank++; continue; }
+    const res = await pgClient.query(
+      `INSERT INTO controller_service_logs
+         (unit_id, body, occurred_on, created_by, created_at, source, source_id)
+       VALUES ($1,$2,$3,$4,$5,'controller_notes',$6)
+       ON CONFLICT (source, source_id) WHERE source_id IS NOT NULL
+       DO UPDATE SET unit_id = EXCLUDED.unit_id, body = EXCLUDED.body,
+                     occurred_on = EXCLUDED.occurred_on, created_by = EXCLUDED.created_by
+       WHERE (controller_service_logs.unit_id, controller_service_logs.body,
+              controller_service_logs.occurred_on, controller_service_logs.created_by)
+         IS DISTINCT FROM
+             (EXCLUDED.unit_id, EXCLUDED.body, EXCLUDED.occurred_on, EXCLUDED.created_by)`,
+      [r.UnitId, body, parseNoteDate(body), r.UserId, r.DateCreated, r.ID],
+    );
+    logsW += res.rowCount;
+  }
+  console.log(`  controller_service_logs: 实际写入 ${logsW} / ${notes.length - logsBlank} 行${logsBlank ? `（跳过 ${logsBlank} 条空正文）` : ''}`);
+  stats.controller_service_logs = { read: notes.length, written: logsW };
+
+  // ── ControllerInfo.Action → controller_service_tasks ───────────────────
+  //
+  // ⚠️ 只写 body / occurred_on / unit_id。status、assigned_to、completed_* 这些是
+  //    **Pro 侧的工作状态**，源库没有对应字段，同步绝不能碰 —— 否则人工把任务标成
+  //    完成，下一轮同步就给打回去了。
+  const actions = (await mssqlPool.request().query(`
+    SELECT UnitId, Action, DateLastUpdate
+      FROM ${SRC_DB}.dbo.ControllerInfo
+     WHERE LTRIM(RTRIM(ISNULL(Action,''))) <> '' ORDER BY UnitId`)).recordset;
+
+  let taskW = 0;
+  for (const r of actions) {
+    const body = nullIfBlank(r.Action);
+    if (!body) continue;
+    const res = await pgClient.query(
+      `INSERT INTO controller_service_tasks
+         (unit_id, body, status, occurred_on, created_at, source, source_id)
+       VALUES ($1,$2,'unknown',$3,$4,'controller_info_action',$5)
+       ON CONFLICT (source, source_id) WHERE source_id IS NOT NULL
+       DO UPDATE SET body = EXCLUDED.body, occurred_on = EXCLUDED.occurred_on
+       WHERE (controller_service_tasks.body, controller_service_tasks.occurred_on)
+         IS DISTINCT FROM (EXCLUDED.body, EXCLUDED.occurred_on)`,
+      [r.UnitId, body, parseNoteDate(body), r.DateLastUpdate ?? new Date(), r.UnitId],
+    );
+    taskW += res.rowCount;
+  }
+  console.log(`  controller_service_tasks: 实际写入 ${taskW} / ${actions.length} 行`);
+  stats.controller_service_tasks = { read: actions.length, written: taskW };
+
+  // ── ControllerInfo.Renewal* → controller_subscriptions (kind='legacy') ──
+  //
+  // 老的 SIM 卡续费。源库只有发票号 + 到期日，没有期限/起算日，所以 kind='legacy'
+  // 并把那些字段留空（表上的完整性 CHECK 对 legacy 豁免）。
+  const renewals = (await mssqlPool.request().query(`
+    SELECT UnitId, LTRIM(RTRIM(RenewalInv)) AS RenewalInv, RenewalDate
+      FROM ${SRC_DB}.dbo.ControllerInfo
+     WHERE RenewalDate IS NOT NULL AND LTRIM(RTRIM(ISNULL(RenewalInv,''))) <> ''
+     ORDER BY UnitId`)).recordset;
+
+  let subW = 0;
+  for (const r of renewals) {
+    const res = await pgClient.query(
+      `INSERT INTO controller_subscriptions
+         (unit_id, kind, ends_on, invoice_no, comm_types_at_sale,
+          paid_by_user_id, note, entered_at)
+       SELECT $1,'legacy',$2,$3,c.comm_types,
+              -- 付费人取设备 owner；没有就记在公司自己的现金账户名下
+              COALESCE(c.owner_user_id, ${CASH_ACCOUNT_USER_ID}),
+              '从 ControllerInfo.RenewalInv/RenewalDate 同步；源库无期限与起算日', NOW()
+         FROM controllers c WHERE c.unit_id = $1
+       ON CONFLICT (unit_id, invoice_no) WHERE invoice_no IS NOT NULL AND voided_at IS NULL
+       DO UPDATE SET ends_on = EXCLUDED.ends_on
+       WHERE controller_subscriptions.ends_on IS DISTINCT FROM EXCLUDED.ends_on`,
+      [r.UnitId, r.RenewalDate, r.RenewalInv],
+    );
+    subW += res.rowCount;
+  }
+  console.log(`  controller_subscriptions(legacy): 实际写入 ${subW} / ${renewals.length} 行`);
+  stats.controller_subscriptions = { read: renewals.length, written: subW };
+
+  return { stats };
+}
+
+/**
+ * 内部数据：ControllerInfo.Notes → admin_controller_notes，
+ *           OperationLog        → admin_operation_logs
+ *
+ * ⚠️ 这两张表都是**仅内部可见**的，与上面 syncServiceRecords 写的两张面向客户的
+ *    表是不同的东西，别合并。区别只在受众，但那正是最容易出事的地方。
+ *
+ * 和 syncServiceRecords 里那三段逐行写法不同，这里走 upserts.js 的批量语句 ——
+ * 备注拆出 6786 行、审计首轮 10826 行，逐行往返（实测 16.87 ms）要 5 分钟，
+ * 塞不进调度周期。
+ */
+async function syncAdminRecords(pgClient, mssqlPool) {
+  console.log('=== Syncing admin-only records ===');
+  const stats = {};
+
+  // ── ① 备注作者：先把 OperationLog 里改过 Notes 的记录读出来 ──────────────
+  //
+  // ControllerInfo.Notes 那一列不记作者，但 adminpage 每次改备注都会在
+  // OperationLog 里留下改前改后的全文 —— 把新出现的那一段认出来就知道是谁加的。
+  // 规则在 derive.deriveNoteAuthors，覆盖率 16.8%（见那里的说明）。
+  //
+  // ⚠️ 这里**不能只读增量**：要判断"某一段是谁加的"，得看它第一次出现在哪条日志
+  //    里，那可能是两年前。所以按 Notes 过滤、读全量（4287 行，远小于整表 1.6 万）。
+  const noteLogs = (await mssqlPool.request().query(`
+    SELECT LogId, UserId, OperationTime, OriginalRecord, UpdatedRecord
+      FROM ${SRC_DB}.dbo.OperationLog
+     WHERE OperationType = 'MODIFY_CONTROLLER'
+       AND (OriginalRecord LIKE '%"Notes"%' OR UpdatedRecord LIKE '%"Notes"%')
+     ORDER BY LogId`)).recordset;
+  const noteAuthors = deriveNoteAuthors(noteLogs);
+
+  // ── ② ControllerInfo.Notes → admin_controller_notes ─────────────────────
+  //
+  // 源列一格里塞着一台设备的全部历史，段间用 '-->' 分隔。拆分与过滤规则在
+  // derive.parseControllerNotes（逐键存盘噪音、字段变更回显、'New Controller'
+  // 前缀全部丢掉）。
+  //
+  // occurred_on 三级回退：日志时间（最准）→ 正文里的澳式日期 → 设备建档日期。
+  //
+  // ⚠️ **每台设备都要进 prune 清单，包括备注为空的**，否则"备注被整段清空"
+  //    这种情况在 PG 里永远删不掉 —— 这类 bug 不会报错，只会让数据慢慢变脏。
+  const noteRows = (await mssqlPool.request().query(`
+    SELECT UnitId, Notes, DateCreated
+      FROM ${SRC_DB}.dbo.ControllerInfo ORDER BY UnitId`)).recordset;
+
+  const notePayload = [];
+  const prune = [];
+  let attributed = 0;
+  for (const r of noteRows) {
+    const fragments = parseControllerNotes(r.Notes);
+    prune.push({ source_id: r.UnitId, keep: fragments.length });
+    fragments.forEach((body, seq) => {
+      const author = noteAuthors.get(`${r.UnitId}|${body}`);
+      if (author) attributed++;
+      notePayload.push({
+        unit_id:     r.UnitId,
+        body,
+        // 日志时间 → 正文日期 → 设备建档日期
+        // ⚠️ 两个源列的时区约定不同：OperationTime 是真 UTC，
+        // DateCreated 是布里斯班墙上时间。见 derive.js 那两个函数的说明。
+        occurred_on: utcInstantToBrisbaneDate(author?.at)
+                     ?? parseNoteDate(body)
+                     ?? wallClockToDate(r.DateCreated),
+        created_by:  author?.userId ?? null,
+        created_at:  r.DateCreated,
+        source_id:   r.UnitId,
+        source_seq:  seq,
+      });
+    });
+  }
+
+  const notesW = await upsertChunked(pgClient, UPSERT_ADMIN_CONTROLLER_NOTES, notePayload);
+  let notesD = 0;
+  for (let i = 0; i < prune.length; i += CHUNK_SIZE) {
+    const res = await pgClient.query(
+      PRUNE_ADMIN_CONTROLLER_NOTES, [JSON.stringify(prune.slice(i, i + CHUNK_SIZE))]);
+    notesD += res.rowCount;
+  }
+  const pct = notePayload.length ? (attributed / notePayload.length * 100).toFixed(1) : '0.0';
+  console.log(
+    `  admin_controller_notes: ${notePayload.length} 段（来自 ${countUnits(notePayload)} 台）`
+    + `，其中 ${attributed} 段能归属到人（${pct}%）`
+    + `，实际写入 ${notesW} 行，删除 ${notesD} 行`);
+  stats.admin_controller_notes = {
+    read: notePayload.length, written: notesW, deleted: notesD, attributed,
+  };
+
+  // ── ③ OperationLog → admin_operation_logs ───────────────────────────────
+  //
+  // 摊平成字段级改动：一条源日志改了 N 个字段就是 N 行。迁移口径、两种源格式的
+  // 处理、密码脱敏都在 derive.deriveOperationLogRows，那里是唯一一份规则。
+  //
+  // ⚠️ **增量读，不是全量。** 源表是 identity 主键的追加型日志（1.6 万行且每天
+  //    还在长），旧行不会被改。只取 LogId 大于已同步最大值的部分，同步耗时就与
+  //    新增量成正比而不是与表大小成正比。库是空的时候 max = 0，自然退化成全量。
+  const { rows: [{ max_id: maxId }] } = await pgClient.query(
+    `SELECT COALESCE(MAX(source_id), 0) AS max_id
+       FROM admin_operation_logs WHERE source = 'operation_log'`);
+
+  const opRows = (await mssqlPool.request().query(`
+    SELECT LogId, UserId, OperationType, OriginalRecord, UpdatedRecord, OperationTime
+      FROM ${SRC_DB}.dbo.OperationLog
+     WHERE LogId > ${Number(maxId)}
+     ORDER BY LogId`)).recordset;
+
+  const opPayload = [];
+  let skippedLogs = 0;
+  for (const r of opRows) {
+    const derived = deriveOperationLogRows(r);
+    if (derived.length === 0) { skippedLogs++; continue; }
+    opPayload.push(...derived);
+  }
+
+  const opsW = await upsertChunked(pgClient, UPSERT_ADMIN_OPERATION_LOGS, opPayload);
+  console.log(
+    `  admin_operation_logs: 源库新增 ${opRows.length} 条日志（LogId > ${Number(maxId)}）`
+    + `，跳过 ${skippedLogs} 条（登录/新增/配件等不迁的类型）`
+    + `，摊平成 ${opPayload.length} 行字段改动，实际写入 ${opsW} 行`);
+  stats.admin_operation_logs = {
+    read: opRows.length, written: opsW, fieldRows: opPayload.length,
+  };
+
+  return { stats };
+}
+
+/** 日志里那句"来自 N 台"—— 只为打印好看，没有别的用处 */
+function countUnits(payload) {
+  return new Set(payload.map((r) => r.unit_id)).size;
+}
+
+
 async function syncAllTables(closePool = false, { triggerSource = 'manual' } = {}) {
   // 先起日志（独立连接），再开事务
   const runId = await startRun(pgPool, { triggerSource, sourceDb: SRC_DB });
@@ -428,6 +727,13 @@ async function syncAllTables(closePool = false, { triggerSource = 'manual' } = {
     tables.user_controller_assignments = as.stats;
 
     await backfillCompanyManagers(pgClient, co.pendingManagers, us.validUserIds);
+
+    // 放最后：这三张表引用 controllers / users，要等上面都就位
+    const sr = await syncServiceRecords(pgClient, mssqlPool);
+    Object.assign(tables, sr.stats);
+
+    const ar = await syncAdminRecords(pgClient, mssqlPool);
+    Object.assign(tables, ar.stats);
 
     await pgClient.query('COMMIT');
 

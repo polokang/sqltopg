@@ -3,8 +3,16 @@
  *
  * 从零建库：删除并重建 AquariusPG 里 Aquareporter-pro 使用的全部表/视图/触发器。
  *
- * ⚠️ 会清空目标数据库里这几张表的数据。已有环境请用
- *    migrations/001_rename_to_snake_case.sql 做原地改名，不要跑这个脚本。
+ * ⚠️ 会清空下面"重建的表"的数据（跑完要 `npm run sync` 重新灌）。不能清空的环境
+ *    用 migrations/ 下的幂等脚本做原地升级（目前是 004、005）。
+ *
+ * 重建的表（DROP + CREATE）：users · companies · controllers · user_controller_assignments ·
+ *   user_identities · user_mfa_factors，以及 4 个视图。
+ *   ⚠️ users.managed_company_ids 是 Pro 人工维护的（不变式 I3），重建后回到派生初值，
+ *      有人工配置时先备份。
+ * 跨重建保留的表（CREATE TABLE IF NOT EXISTS）：controller_subscriptions ·
+ *   controller_service_logs · controller_service_tasks · admin_controller_notes ·
+ *   admin_operation_logs · sync_runs
  *
  * 命名规范：Aquareporter-pro/docs/migration/05-pg-naming-convention.md
  *   · 全部 lower_snake_case，永不加引号
@@ -12,8 +20,9 @@
  *   · 跨系统业务标识用 <entity>_id，纯内部代理键用 id
  *   · 约束/索引不显式命名，交给 PG 生成默认名
  *
- * 不由本脚本管理的表（adminpage 自有，手工建的）：
- *   admin_user_roles · admin_role_permissions · firmware_update_logs
+ * 不由本脚本管理、也不会被它碰到的表（adminpage 自有，见 adminpage-api/prisma/pg/*.sql）：
+ *   admin_roles · admin_permissions · admin_role_permissions · admin_user_roles ·
+ *   firmware_update_logs · product_labels · product_serial_counters
  *
  * Run: npm run init-db
  */
@@ -21,11 +30,17 @@
 import dotenv from 'dotenv';
 import pg from 'pg';
 import { getPostgresUrl } from './dbConfig.js';
-import { COMM_TYPE, COMM_TYPE_VALUES, COMM_TYPE_EXCLUSIVE } from './derive.js';
+import {
+  COMM_TYPE, COMM_TYPE_VALUES, COMM_TYPE_EXCLUSIVE, OPERATION_TARGET_TYPES,
+  CASH_ACCOUNT_USER_ID,
+} from './derive.js';
 
 dotenv.config();
 
 const { Client } = pg;
+
+/** admin_operation_logs.target_type 的 CHECK —— 取值清单只在 derive.js 里维护一份 */
+const TARGET_TYPE_SQL = OPERATION_TARGET_TYPES.map((t) => "'" + t + "'").join(', ');
 
 async function initDatabase() {
   const client = new Client({
@@ -104,10 +119,13 @@ async function initDatabase() {
     //   · 切到 PG 权威（P6）后可以执行：
     //       ALTER TABLE users ALTER COLUMN user_id SET DEFAULT nextval('users_user_id_seq');
     //
-    // ⚠️ 没有 sync_source 列。users 整表来自 SQL Server，不存在 Pro 自建的行，
-    //    孤儿清理直接按"源库里还在不在"判断即可。
-    //    （user_controller_assignments 保留了这一列 —— 那张表上 Pro 确实会写
-    //     sync_source='pro' 的行，见该表的说明。）
+    // sync_source —— 2026-10-14 重新加回（方案 A 阶段 0.2，修同步竞态）。
+    //    sqltopg 每轮"先读快照 → UPSERT → 孤儿清理"。Pro 双写在"读快照"之后
+    //    新建的用户不在快照里，旧的无条件清理会把它当孤儿删掉（连带 CASCADE 掉授权）。
+    //    现在：Pro 写入标 'pro'；孤儿清理只删 'mssql' 行；下一轮同步 UPSERT 命中
+    //    时改回 'mssql'（见 upserts.js），之后源库删了它才会正常清理。
+    //    controllers / user_controller_assignments 同理（不变式 I2，见 sync-simple.js）。
+    //    ⚠️ 只存在于 PG、长期停在 'pro' 的行 = Pro 双写漏了权威库，由对账发现。
     //
     // roles —— 只有 super / manager / operator 三个值，由 UserTypeId 派生（见
     //   src/derive.js 的 deriveRoles）。**没有 owner** —— Owner 是 per-controller
@@ -141,7 +159,9 @@ async function initDatabase() {
         linked_providers    VARCHAR[]    NOT NULL DEFAULT '{}',
         last_login_at       TIMESTAMPTZ,
         created_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-        updated_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+        updated_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+        sync_source         VARCHAR(10)  NOT NULL DEFAULT 'mssql'
+                              CHECK (sync_source IN ('mssql', 'pro'))
       );
     `);
     await client.query(`ALTER SEQUENCE users_user_id_seq OWNED BY users.user_id;`);
@@ -247,8 +267,12 @@ async function initDatabase() {
     // 三处相对旧 schema 的语义修正：
     //   production_status ← 旧名 Status。存的是 SQL Server 的 ProductionStatus
     //                       (0=暂停 3=生产中 4=已完成)，与"设备通讯状态"无关。
-    //   site_location     ← 旧名 Creator。存的是 SQL Server 的 SiteLocation，
-    //                       叫 Creator 是同步脚本的失误。
+    //   creator           ← SiteLocation。⚠️ 这一列**不是站点位置**，装的是建档人：
+    //                       实查只有 5 个取值 Other(6681) / Vish(724) / Andrew(515) /
+    //                       Brad(48) / Sooni(30)，与 adminpage 的 operatorOptions 完全一致
+    //                       （adminpage-web 的 Edit.tsx，界面上标的是 "operator"）。
+    //                       旧同步脚本曾叫它 Creator，后来被"更正"成 site_location ——
+    //                       那次更正是错的，2026-09-18 已改回。
     //   company_id        ← 取 **ControllerInfo.CompanyId 原值**（"这台设备由哪家
     //                       公司管理"），不是 Owner 所属公司。这是 Manager 权限的
     //                       判据（managed_company_ids ∋ company_id），取错会让
@@ -262,6 +286,15 @@ async function initDatabase() {
     //   model_code        ← 旧名 ControllerModel。生产物料型号（ULTIMA3P / BSMARTAS6
     //                       …共 175 种），编码了产品系列＋泵数＋通信＋变体。
     //                       清洗规则见 derive.js 的 deriveControllerModel。
+    //   accessory_serial_numbers ← 旧名 spare_parts（源列 Serials）。装的是随机附带
+    //                       的部件序列号清单，不是"备件库存"，mapping.json 2026-09-21
+    //                       改成了现在这个名字。切分规则见 derive.js 的 classifySerials。
+    //   billing_email     ← Owner（AccManagerId）在 UserInfomation 里的 Email，派生值，
+    //                       ControllerInfo 没有这一列（R-004）。Pro 只写 PG 的修改会被同步盖回。
+    //   notes             ← **这一列没有了**。ControllerInfo.Notes 一格里塞着一台设备
+    //                       的全部历史（段间用 '-->' 分隔），已按段拆进
+    //                       admin_controller_notes（见第 13 节）。
+    //
     //   comm_types        ← 从 SIMCardNo **拆出来的新列**（数组）。老库把"通信方式"和
     //                       "SIM 卡号"挤在同一列（选 Ethernet 就往 SIMCardNo 里
     //                       写字符串 'Ethernet'），2026-10 的通信套餐要按
@@ -297,15 +330,16 @@ async function initDatabase() {
         timezone_id       VARCHAR(50),
         production_status INTEGER,
         activated         BOOLEAN      NOT NULL DEFAULT false,
-        site_location     VARCHAR(255),
+        creator           VARCHAR(50),
         tags              TEXT[],
         billing_email     VARCHAR(100),
         bar_code          VARCHAR(50),
         po_number         VARCHAR(50),
-        spare_parts       VARCHAR(200),
-        notes             TEXT,
+        accessory_serial_numbers TEXT[],
         created_at        TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-        updated_at        TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+        updated_at        TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+        sync_source       VARCHAR(10)  NOT NULL DEFAULT 'mssql'
+                            CHECK (sync_source IN ('mssql', 'pro'))
       );
     `);
     await client.query(`CREATE INDEX ON controllers (owner_user_id);`);
@@ -314,6 +348,8 @@ async function initDatabase() {
     // "哪些 Eth/WiFi 设备还没录通信套餐"这张报表按 comm_types 做集合相交
     // （comm_types && ARRAY['ethernet','wifi']），GIN 是这类查询的索引类型
     await client.query(`CREATE INDEX ON controllers USING GIN (comm_types);`);
+    // "哪台设备装了序列号 X" —— accessory_serial_numbers 是数组，用 GIN
+    await client.query(`CREATE INDEX ON controllers USING GIN (accessory_serial_numbers);`);
     await client.query(`CREATE INDEX ON controllers (created_at);`);
 
     // ── 9. user_controller_assignments ───────────────────────────────────────
@@ -377,31 +413,101 @@ async function initDatabase() {
     //
     // comm_types_at_sale —— 售出时的通信方式快照。设备日后升级通信方式不应改写
     //   历史订阅的计费依据。
+    //
+    // paid_by_user_id —— **这笔钱是谁付的**。这张表现在只记设备的订阅，以后要
+    //   接用户付费记录 —— 付费人这一维度必须在设计阶段就在，事后补就只能
+    //   把已有的几百条历史全算到一个默认人头上。
+    //
+    //   迁过来的 legacy 行取设备的 owner（ControllerInfo.AccManagerId）—— 2026-09-22
+    //   实测 379 台有 Renewal 记录的设备**全部**有 owner，一条都不用兜底。
+    //   没有付费用户时记在公司自己的现金账户名下（derive.js 的
+    //   CASH_ACCOUNT_USER_ID = 5040，'Spare Parts' / 'Aquarius Corp Acc'）。
+    //   留 NULL 是最差的选择：“这笔钱没人付”和“不知道谁付的”分不开。
+    //
+    // ⚠️ 不加外键，理由同 unit_id。
     console.log('Creating controller_subscriptions (preserved across rebuilds)...');
     await client.query(`
       CREATE TABLE IF NOT EXISTS controller_subscriptions (
         id                 BIGSERIAL     PRIMARY KEY,
         unit_id            INTEGER       NOT NULL,
+        -- 'legacy' 专给从 ControllerInfo.RenewalInv / RenewalDate 迁过来的历史 SIM 续费。
+        -- 源库只有"发票号 + 到期日"两列，没有期限也没有起算日 —— 缺的字段一律留空，
+        -- 不编一个出来。新录入的必须是 included / renewal 且字段齐全（见下方 CHECK）。
         kind               VARCHAR(20)   NOT NULL
-                             CHECK (kind IN ('included', 'renewal')),
-        term_years         SMALLINT      NOT NULL CHECK (term_years IN (1, 5, 10)),
-        ordered_on         DATE          NOT NULL,
-        starts_on          DATE          NOT NULL,
+                             CONSTRAINT subs_kind_valid
+                             CHECK (kind IN ('included', 'renewal', 'legacy')),
+        term_years         SMALLINT      CONSTRAINT subs_term_valid
+                             CHECK (term_years IN (1, 5, 10)),
+        ordered_on         DATE,
+        starts_on          DATE,
+        -- 到期日是任何来源都有的字段，所以只有它保持 NOT NULL
         ends_on            DATE          NOT NULL,
         invoice_no         VARCHAR(50),
         po_number          VARCHAR(50),
         sold_to_company_id INTEGER,
         comm_types_at_sale VARCHAR(20)[] NOT NULL,
         note               TEXT,
+        paid_by_user_id    INTEGER       NOT NULL DEFAULT ${CASH_ACCOUNT_USER_ID},
         entered_by         INTEGER,
         entered_at         TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
         voided_at          TIMESTAMPTZ,
         voided_by          INTEGER,
         voided_reason      TEXT,
-        CHECK (ends_on > starts_on),
-        CHECK ((voided_at IS NULL) = (voided_reason IS NULL))
+        CONSTRAINT subs_dates_ordered CHECK (starts_on IS NULL OR ends_on > starts_on),
+        CONSTRAINT subs_void_paired   CHECK ((voided_at IS NULL) = (voided_reason IS NULL)),
+        -- 只有 legacy 允许缺字段；新录入的必须齐全，否则到期提醒和续费金额都算不出来
+        CONSTRAINT subs_complete_unless_legacy
+          CHECK (kind = 'legacy'
+                 OR (term_years IS NOT NULL AND ordered_on IS NOT NULL AND starts_on IS NOT NULL))
       );
     `);
+    // ⚠️ 上面是 CREATE TABLE IF NOT EXISTS —— **表已存在时整段会被跳过**，
+    //    改了列定义也不会生效。所以凡是"跨重建保留"的表，都要在这里补一段幂等的
+    //    ALTER 把已有表升级到当前定义。2026-09-18 就是漏了这一步，导致放宽约束后
+    //    迁移仍然报 term_years not-null。
+    //
+    //    新增列用 ADD COLUMN IF NOT EXISTS；改约束则先按名字 DROP 再 ADD，
+    //    所以上面的 CHECK 都起了显式名字。
+    console.log('  ↻ 升级 controller_subscriptions 到当前定义…');
+    await client.query(`
+      ALTER TABLE controller_subscriptions
+        ALTER COLUMN term_years DROP NOT NULL,
+        ALTER COLUMN ordered_on DROP NOT NULL,
+        ALTER COLUMN starts_on  DROP NOT NULL,
+        ADD COLUMN IF NOT EXISTS paid_by_user_id INTEGER NOT NULL
+          DEFAULT ${CASH_ACCOUNT_USER_ID};`);
+    // 老版本的匿名 CHECK（PG 自动命名 *_check）要一并清掉，否则旧规则还在生效
+    await client.query(`
+      DO $$
+      DECLARE c record;
+      BEGIN
+        FOR c IN
+          SELECT conname FROM pg_constraint
+           WHERE conrelid = 'controller_subscriptions'::regclass
+             AND contype = 'c'
+             AND conname NOT LIKE 'subs\\_%'
+        LOOP
+          EXECUTE format('ALTER TABLE controller_subscriptions DROP CONSTRAINT %I', c.conname);
+        END LOOP;
+      END $$;`);
+    for (const [name, expr] of [
+      ['subs_kind_valid', `kind IN ('included','renewal','legacy')`],
+      ['subs_term_valid', `term_years IN (1,5,10)`],
+      ['subs_dates_ordered', `starts_on IS NULL OR ends_on > starts_on`],
+      ['subs_void_paired', `(voided_at IS NULL) = (voided_reason IS NULL)`],
+      ['subs_complete_unless_legacy',
+        `kind = 'legacy' OR (term_years IS NOT NULL AND ordered_on IS NOT NULL AND starts_on IS NOT NULL)`],
+    ]) {
+      await client.query(`
+        DO $$ BEGIN
+          IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                          WHERE conrelid = 'controller_subscriptions'::regclass
+                            AND conname = '${name}') THEN
+            ALTER TABLE controller_subscriptions ADD CONSTRAINT ${name} CHECK (${expr});
+          END IF;
+        END $$;`);
+    }
+
     // 一台设备只能有一条**有效的**赠送套餐 —— 防销售重复录入
     await client.query(`
       CREATE UNIQUE INDEX IF NOT EXISTS controller_subscriptions_one_included_idx
@@ -415,13 +521,262 @@ async function initDatabase() {
     await client.query(`
       CREATE INDEX IF NOT EXISTS controller_subscriptions_unit_idx
         ON controller_subscriptions (unit_id, starts_on DESC);`);
+    // “这个人（或现金账户）名下有哪些订阅”—— 接用户付费记录后的主要查法
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS controller_subscriptions_payer_idx
+        ON controller_subscriptions (paid_by_user_id, ends_on DESC)
+        WHERE voided_at IS NULL;`);
     // "还有几天到期"报表按 ends_on 排序
     await client.query(`
       CREATE INDEX IF NOT EXISTS controller_subscriptions_expiry_idx
         ON controller_subscriptions (ends_on)
         WHERE voided_at IS NULL;`);
 
-    // ── 11. Views ────────────────────────────────────────────────────────────
+    // ── 11. controller_service_logs —— 设备服务记录（面向客户）─────────────────
+    //
+    // 数据源：ControllerNotes 整表（682 行 / 313 台）。内容是服务工程师写的现场记录
+    // （"setpoint raised to 695mV"、"CS41 replaced; calibrated pH"），面向**客户**。
+    //
+    // ⚠️ 与 sync_runs / controller_subscriptions 同样处理：CREATE TABLE IF NOT EXISTS，
+    //    且**不在第 2 节的 DROP 列表里**。一次性迁移之后由应用继续写入，
+    //    重建镜像表不能把它清掉。
+    //
+    // ⚠️ unit_id / created_by **不加外键** —— 第 2 节的 DROP … CASCADE 会把引用
+    //    controllers / users 的外键约束静默删除（表和数据不丢，但约束没了且不报错）。
+    //
+    // source + source_id 让一次性迁移可以重复执行：同一条 ControllerNotes.ID
+    // 再迁一次会撞唯一索引而被跳过，不会产生重复行。
+    console.log('Creating controller_service_logs (preserved across rebuilds)...');
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS controller_service_logs (
+        id                  BIGSERIAL   PRIMARY KEY,
+        unit_id             INTEGER     NOT NULL,
+        body                TEXT        NOT NULL,
+        occurred_on         DATE,
+        created_by          INTEGER,
+        created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        -- 个别记录是内部升级讨论，不该给客户看；默认可见、个别置否
+        visible_to_customer BOOLEAN     NOT NULL DEFAULT true,
+        source              VARCHAR(30) NOT NULL DEFAULT 'manual'
+                              CHECK (source IN ('manual', 'controller_notes')),
+        source_id           INTEGER
+      );
+    `);
+    await client.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS controller_service_logs_source_idx
+        ON controller_service_logs (source, source_id)
+        WHERE source_id IS NOT NULL;`);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS controller_service_logs_unit_idx
+        ON controller_service_logs (unit_id, created_at DESC);`);
+
+    // ── 12. controller_service_tasks —— 派工任务（面向客户）────────────────────
+    //
+    // 数据源：ControllerInfo.Action（263 台）。内容是技术支持记录的处理动作
+    // （"Tech Advised - No Flow 25/6/26"）。
+    //
+    // ⚠️ 旧实现 ControllerService.ActionSave 用的是 `.Set(unit => unit.Action, action)`
+    //    —— **覆盖写**，每记一次新动作上一次就被抹掉。所以迁过来的 263 条只是"最后
+    //    一次"，更早的历史在源库里就已经没了。新表按行追加，不再有这个问题。
+    //
+    // status 里的 'unknown' 是给迁移数据用的：那 263 条没有任何完成信息，
+    // 标 'done' 是编造、标 'open' 会凭空造出 263 个未完成任务，都不诚实。
+    // 它的行数只应随人工认领而下降，可以当清理进度看。
+    console.log('Creating controller_service_tasks (preserved across rebuilds)...');
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS controller_service_tasks (
+        id                  BIGSERIAL   PRIMARY KEY,
+        unit_id             INTEGER     NOT NULL,
+        body                TEXT        NOT NULL,
+        status              VARCHAR(20) NOT NULL DEFAULT 'open'
+                              CHECK (status IN ('open','in_progress','done','cancelled','unknown')),
+        assigned_to         INTEGER,
+        due_on              DATE,
+        occurred_on         DATE,
+        created_by          INTEGER,
+        created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        completed_at        TIMESTAMPTZ,
+        completed_by        INTEGER,
+        completion_note     TEXT,
+        visible_to_customer BOOLEAN     NOT NULL DEFAULT true,
+        source              VARCHAR(30) NOT NULL DEFAULT 'manual'
+                              CHECK (source IN ('manual', 'controller_info_action')),
+        source_id           INTEGER,
+        -- 标成已完成就必须有完成时间；其余状态不强制
+        CHECK (status <> 'done' OR completed_at IS NOT NULL)
+      );
+    `);
+    await client.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS controller_service_tasks_source_idx
+        ON controller_service_tasks (source, source_id)
+        WHERE source_id IS NOT NULL;`);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS controller_service_tasks_unit_idx
+        ON controller_service_tasks (unit_id, created_at DESC);`);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS controller_service_tasks_open_idx
+        ON controller_service_tasks (status, assigned_to)
+        WHERE status IN ('open','in_progress');`);
+
+    // ── 13. admin_controller_notes —— 生产/内部备注（仅内部可见）──────────────
+    //
+    // 数据源：ControllerInfo.Notes（7409 台有值）。⚠️ 与 controller_service_logs
+    // 的区别只有受众：那张表是服务工程师写给**客户**看的现场记录，这张表是产线和
+    // 后台人员写给**自己**看的，绝不能出现在客户界面上。所以两者不合并。
+    //
+    // ⚠️ 源列是一格里塞了一台设备的全部历史，段与段之间用 '-->' 分隔，最长一台
+    //    有 39 段。照抄成一个 TEXT 列（原来 controllers.notes 就是这么干的）的
+    //    后果是：查不了"某台设备 2026-02 发生过什么"、排不了序、也没法单独标记
+    //    某一段。这里按段拆成行，拆分与过滤规则见 derive.js 的 parseControllerNotes。
+    //
+    // ⚠️ 与 sync_runs / controller_subscriptions / controller_service_* 同样处理：
+    //    CREATE TABLE IF NOT EXISTS，且**不在第 2 节的 DROP 列表里**。
+    //
+    // ⚠️ unit_id / created_by **不加外键** —— 第 2 节的 DROP … CASCADE 会把引用
+    //    controllers / users 的外键约束静默删掉（表和数据不丢，但约束没了且不报错）。
+    //
+    // 自然键是 (source, source_id, source_seq)：source_id = UnitId，source_seq 是
+    // **过滤后**的段序号。新备注一律追加在末尾，已有段的序号不会移动，所以同步
+    // 可以按这个键幂等 UPSERT；源里段数变少时同步会删掉尾部多出来的行。
+    // 应用自己写的行 source='manual' 且 source_id 为 NULL，落不进那个偏唯一索引，
+    // **永远不会被同步动到**。
+    //
+    // ── created_by：写备注的人 ─────────────────────────────────────────────
+    //
+    // 源列没有作者。三条路都查过：`UserIdForLastChange` 只有 62/8045 台有值；
+    // 正文结尾的首字母签名只覆盖 2.7% 且一半是 SN/ORP/PRO 这种技术缩写；
+    // 能用的只有 OperationLog —— adminpage 每次改备注都会存下改前改后全文，
+    // 把新出现的那一段认出来就知道是谁加的（derive.js 的 deriveNoteAuthors）。
+    //
+    // ⚠️ 只能覆盖 **16.8%**（1132/6744 段）—— OperationLog 最早到 2024-07，
+    //    而备注能追到 2015。剩下的留 NULL，**不拿设备 owner 顶上** —— 备注是
+    //    产线和后台人员写的，owner 是客户侧的客户经理，填了就是错的。
+    //
+    // ── occurred_on：这段备注讲的是哪一天 ───────────────────────────────
+    //
+    // 三级回退：① 能对上作者的用日志时间（最准）→ ② 从正文里抠出的澳式
+    // 日期（'25/6/26'，见 parseNoteDate）→ ③ 设备的建档日期 DateCreated。
+    //
+    // ③ 是个占位值，不是真实发生日期 —— 判别方法是 `occurred_on = created_at::date`
+    // （created_at 存的就是 DateCreated）。需要“只看有真实日期的”时把这批排掉即可。
+    console.log('Creating admin_controller_notes (preserved across rebuilds)...');
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS admin_controller_notes (
+        id          BIGSERIAL   PRIMARY KEY,
+        unit_id     INTEGER     NOT NULL,
+        body        TEXT        NOT NULL,
+        occurred_on DATE,
+        created_by  INTEGER,
+        created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        source      VARCHAR(30) NOT NULL DEFAULT 'manual'
+                      CHECK (source IN ('manual', 'controller_info_notes')),
+        source_id   INTEGER,
+        source_seq  SMALLINT
+      );
+    `);
+    await client.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS admin_controller_notes_source_idx
+        ON admin_controller_notes (source, source_id, source_seq)
+        WHERE source_id IS NOT NULL;`);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS admin_controller_notes_unit_idx
+        ON admin_controller_notes (unit_id, source_seq);`);
+    await client.query(`COMMENT ON TABLE  admin_controller_notes            IS '内部备注（旧 ControllerInfo.Notes 按 --> 拆行）。⚠️ 仅内部可见，不要暴露给客户界面'`);
+    await client.query(`COMMENT ON COLUMN admin_controller_notes.source_seq  IS '该设备第几段备注（过滤后的稠密序号，从 0 起）'`);
+    await client.query(`COMMENT ON COLUMN admin_controller_notes.created_by  IS '写备注的人。迁移行只有 16.8% 能从 OperationLog 反推出来，其余为 NULL'`);
+    await client.query(`COMMENT ON COLUMN admin_controller_notes.occurred_on IS '日志时间 → 正文里的日期 → 设备建档日期。等于 created_at::date 时是兜底值，不是真实发生日'`);
+
+    // ── 14. admin_operation_logs —— 后台改动审计（仅内部可见）─────────────────
+    //
+    // 一行回答一个问题：**谁 · 什么时候 · 把哪条记录的哪个字段 · 改成了什么**。
+    //
+    // ⚠️ 这不是 SQL Server `OperationLog` 的镜像。那张表一行存两份整行快照
+    //    （47-52 列的 JSON），臃肿且查不动 —— 想知道"这台设备的 SystemID 被谁改过"
+    //    只能 `WHERE updated_record::text LIKE '%…%'` 再人工比对两份 JSON。
+    //    这里把它**摊平成字段级改动**：一条源日志改了 3 个字段就是 3 行。
+    //    9653 行（2026-09-22）覆盖了源库 4895 条相关日志。
+    //
+    // ⚠️ **不存改动前的值。** 需求只要"改成了什么"；存旧值要么整行翻倍，要么就得
+    //    保留那两份快照，正好是这次要甩掉的东西。真要回溯某一刻的完整状态，
+    //    按 (target_type, target_id) 把这张表从头放一遍即可。
+    //
+    // 迁移口径与两种源格式的处理都在 derive.js 的 deriveOperationLogRows：
+    //   · 只迁设备与用户的修改，外加续费（UPDATE_RENEWAL 按台拆行）
+    //   · LOGIN / LOGINTOREPORT 不迁 —— 那两类的 UpdatedRecord 是 8 小时有效的
+    //     登录 JWT 原文，每天同步等于把还能用的 bearer token 复制进一张随便谁
+    //     都能查的审计表
+    //   · ADD_CONTROLLER / ADD_USER / RELEASE_CONTROLLER 不迁 —— 整条新增没有
+    //     "改成什么"可记，全展开是 6 万行建档噪音
+    //   · 明文密码列不记，只留 password_hash 一行、值抹成 '***'
+    //
+    // field 用的是 **PG 的列名**（`creator` 而不是 `SiteLocation`），映射表在
+    // derive.js。PG 里没有的列保持源列名 —— 那是当年真的改过的东西，不能因为
+    // 现在不迁就假装没发生。
+    //
+    // ⚠️ 同样是 CREATE TABLE IF NOT EXISTS 且不在 DROP 列表里 —— 审计数据，
+    //    重建镜像表不能清掉。actor_user_id / target_id 不加外键，理由同前。
+    console.log('Creating admin_operation_logs (preserved across rebuilds)...');
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS admin_operation_logs (
+        id             BIGSERIAL   PRIMARY KEY,
+        occurred_at    TIMESTAMPTZ NOT NULL,
+        actor_user_id  INTEGER,
+        operation_type VARCHAR(30) NOT NULL,
+        target_type    VARCHAR(20) NOT NULL
+                         CONSTRAINT admin_operation_logs_target_type_valid
+                         CHECK (target_type IN (${TARGET_TYPE_SQL})),
+        target_id      INTEGER     NOT NULL,
+        field          VARCHAR(50) NOT NULL,
+        -- NULL 表示这个字段被清空了，与"没记"区分开
+        new_value      TEXT,
+        source         VARCHAR(30) NOT NULL DEFAULT 'manual'
+                         CONSTRAINT admin_operation_logs_source_valid
+                         CHECK (source IN ('manual', 'operation_log')),
+        source_id      INTEGER,
+        -- 同一条源日志拆出的第几行（一次改 N 个字段就有 N 行）
+        source_seq     SMALLINT
+      );
+    `);
+    // 建表用的是 IF NOT EXISTS —— 表已存在时整段会被跳过，所以 CHECK 都起了
+    // 显式名字，这里按名字幂等重建（同 controller_subscriptions 的处理）
+    for (const [name, expr] of [
+      ['admin_operation_logs_target_type_valid', `target_type IN (${TARGET_TYPE_SQL})`],
+      ['admin_operation_logs_source_valid', `source IN ('manual', 'operation_log')`],
+    ]) {
+      await client.query(`
+        DO $$ BEGIN
+          IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                          WHERE conrelid = 'admin_operation_logs'::regclass
+                            AND conname = '${name}') THEN
+            ALTER TABLE admin_operation_logs ADD CONSTRAINT ${name} CHECK (${expr});
+          END IF;
+        END $$;`);
+    }
+    await client.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS admin_operation_logs_source_idx
+        ON admin_operation_logs (source, source_id, source_seq)
+        WHERE source_id IS NOT NULL;`);
+    // "这台设备/这个用户被谁改过" —— 这张表存在的理由，也是唯一必须快的查询
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS admin_operation_logs_target_idx
+        ON admin_operation_logs (target_type, target_id, occurred_at DESC);`);
+    // "这个字段历史上都被改成过什么"（例如某台设备的 sim_card_no 变更史）
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS admin_operation_logs_field_idx
+        ON admin_operation_logs (target_type, target_id, field, occurred_at DESC);`);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS admin_operation_logs_actor_idx
+        ON admin_operation_logs (actor_user_id, occurred_at DESC);`);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS admin_operation_logs_occurred_idx
+        ON admin_operation_logs (occurred_at DESC);`);
+    await client.query(`COMMENT ON TABLE  admin_operation_logs                IS '后台字段级改动审计（旧 OperationLog 摊平）。⚠️ 仅内部可见；不存旧值；登录事件与新增事件不迁；明文密码抹成 ***'`);
+    await client.query(`COMMENT ON COLUMN admin_operation_logs.actor_user_id  IS '做这次改动的人（源列 UserId），不是被改的对象'`);
+    await client.query(`COMMENT ON COLUMN admin_operation_logs.field          IS 'PG 列名；PG 里没有的列保持源列名（如 SetupVersionId）'`);
+    await client.query(`COMMENT ON COLUMN admin_operation_logs.new_value      IS '改成了什么。NULL = 被清空；密码类一律 ***'`);
+
+
+    // ── 15. Views ────────────────────────────────────────────────────────────
     // 旧的 "UserFullInfo" 是 users 的纯投影，没有抽象价值，不再重建。
     console.log('Creating views...');
     await client.query(`
@@ -503,7 +858,7 @@ async function initDatabase() {
        ORDER BY unit_id;
     `);
 
-    // ── 12. sync_runs —— 同步运行日志 ────────────────────────────────────────
+    // ── 16. sync_runs —— 同步运行日志 ────────────────────────────────────────
     //
     // ⚠️ 用 CREATE TABLE IF NOT EXISTS，且**刻意不在第 2 节的 DROP 列表里**：
     //    这张表记的是运维历史，不是镜像数据。重建镜像表不该把同步历史一起清掉，
@@ -541,7 +896,7 @@ async function initDatabase() {
 
     await client.query(`COMMENT ON TABLE  sync_runs                IS '每次同步运行一行。由 src/syncLog.js 在同步事务之外写入；init-db 不清空本表'`);
     await client.query(`COMMENT ON COLUMN sync_runs.tables         IS '每张表的明细：{"users":{"read":5072,"written":0,"deleted":0}, …}'`);
-    await client.query(`COMMENT ON COLUMN sync_runs.trigger_source IS 'scheduled=每日定时 / startup=服务启动时 / manual=手工 npm run sync'`);
+    await client.query(`COMMENT ON COLUMN sync_runs.trigger_source IS 'scheduled=按调度触发（间隔或每日定时）/ startup=服务启动时 / manual=手工 npm run sync'`);
     await client.query(`COMMENT ON COLUMN sync_runs.status         IS 'running 长期不变说明该次运行崩溃或被杀'`);
 
     await client.query('COMMIT');

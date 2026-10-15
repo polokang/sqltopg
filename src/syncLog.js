@@ -109,6 +109,32 @@ export async function reapStaleRuns(pool) {
     }
 }
 
+/**
+ * 删掉超过保留期的运行记录。
+ *
+ * 间隔模式每 2 分钟一行 = 每天 720 行、一年约 26 万行，不清理会无限增长。
+ * 由 index.js 在启动时和每轮同步后调用；有 started_at 索引，删除本身很便宜。
+ * 只删已结束的行 —— 'running' 交给 reapStaleRuns 处理。
+ *
+ * @param {number} days  保留天数；<= 0 表示不清理
+ */
+export async function pruneOldRuns(pool, days) {
+    if (!(days > 0)) return;
+    try {
+        const { rowCount } = await pool.query(
+            `DELETE FROM sync_runs
+              WHERE status <> 'running'
+                AND started_at < NOW() - make_interval(days => $1)`,
+            [Math.floor(days)],
+        );
+        if (rowCount > 0) {
+            console.log(`  清理了 ${rowCount} 条超过 ${days} 天的同步记录`);
+        }
+    } catch (err) {
+        console.error(`⚠ 清理过期同步记录失败（不影响同步）: ${err.message}`);
+    }
+}
+
 /** 供健康检查接口用：最近 n 次运行的摘要。 */
 export async function recentRuns(pool, n = 5) {
     try {
