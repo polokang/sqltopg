@@ -13,7 +13,8 @@
  *   controller_service_tasks    ← dbo.ControllerInfo.Action（面向客户）
  *   controller_subscriptions    ← dbo.ControllerInfo.RenewalInv/RenewalDate（kind='legacy'）
  *   admin_controller_notes      ← dbo.ControllerInfo.Notes（按 '-->' 拆行，**仅内部**）
- *   admin_operation_logs        ← dbo.OperationLog（增量，**仅内部**）
+ *
+ * 不再同步：admin_operation_logs（2026-10-30 起归 adminpage，由它直接写入）
  *
  * 不同步（Pro 自有数据，SQL Server 没有对应表/字段）：
  *   user_identities            Passkey / Google 绑定
@@ -76,7 +77,6 @@ import {
   classifySerials,
   parseNoteDate,
   parseControllerNotes,
-  deriveOperationLogRows,
   deriveNoteAuthors,
   utcInstantToBrisbaneDate,
   wallClockToDate,
@@ -98,7 +98,6 @@ import {
   UPSERT_ASSIGNMENTS,
   UPSERT_ADMIN_CONTROLLER_NOTES,
   PRUNE_ADMIN_CONTROLLER_NOTES,
-  UPSERT_ADMIN_OPERATION_LOGS,
 } from './upserts.js';
 
 dotenv.config();
@@ -563,15 +562,16 @@ async function syncServiceRecords(pgClient, mssqlPool) {
 }
 
 /**
- * 内部数据：ControllerInfo.Notes → admin_controller_notes，
- *           OperationLog        → admin_operation_logs
+ * 内部数据：ControllerInfo.Notes → admin_controller_notes
  *
- * ⚠️ 这两张表都是**仅内部可见**的，与上面 syncServiceRecords 写的两张面向客户的
+ * ⚠️ 这张表是**仅内部可见**的，与上面 syncServiceRecords 写的两张面向客户的
  *    表是不同的东西，别合并。区别只在受众，但那正是最容易出事的地方。
  *
  * 和 syncServiceRecords 里那三段逐行写法不同，这里走 upserts.js 的批量语句 ——
- * 备注拆出 6786 行、审计首轮 10826 行，逐行往返（实测 16.87 ms）要 5 分钟，
- * 塞不进调度周期。
+ * 备注拆出 6786 行，逐行往返（实测 16.87 ms）塞不进调度周期。
+ *
+ * ⚠️ 2026-10-30 起 adminpage 不再写 OperationLog，下面 ① 的备注作者只能从历史日志
+ *    里认出来；之后新加的备注 created_by 为 NULL。
  */
 async function syncAdminRecords(pgClient, mssqlPool) {
   console.log('=== Syncing admin-only records ===');
@@ -649,40 +649,11 @@ async function syncAdminRecords(pgClient, mssqlPool) {
     read: notePayload.length, written: notesW, deleted: notesD, attributed,
   };
 
-  // ── ③ OperationLog → admin_operation_logs ───────────────────────────────
-  //
-  // 摊平成字段级改动：一条源日志改了 N 个字段就是 N 行。迁移口径、两种源格式的
-  // 处理、密码脱敏都在 derive.deriveOperationLogRows，那里是唯一一份规则。
-  //
-  // ⚠️ **增量读，不是全量。** 源表是 identity 主键的追加型日志（1.6 万行且每天
-  //    还在长），旧行不会被改。只取 LogId 大于已同步最大值的部分，同步耗时就与
-  //    新增量成正比而不是与表大小成正比。库是空的时候 max = 0，自然退化成全量。
-  const { rows: [{ max_id: maxId }] } = await pgClient.query(
-    `SELECT COALESCE(MAX(source_id), 0) AS max_id
-       FROM admin_operation_logs WHERE source = 'operation_log'`);
-
-  const opRows = (await mssqlPool.request().query(`
-    SELECT LogId, UserId, OperationType, OriginalRecord, UpdatedRecord, OperationTime
-      FROM ${SRC_DB}.dbo.OperationLog
-     WHERE LogId > ${Number(maxId)}
-     ORDER BY LogId`)).recordset;
-
-  const opPayload = [];
-  let skippedLogs = 0;
-  for (const r of opRows) {
-    const derived = deriveOperationLogRows(r);
-    if (derived.length === 0) { skippedLogs++; continue; }
-    opPayload.push(...derived);
-  }
-
-  const opsW = await upsertChunked(pgClient, UPSERT_ADMIN_OPERATION_LOGS, opPayload);
-  console.log(
-    `  admin_operation_logs: 源库新增 ${opRows.length} 条日志（LogId > ${Number(maxId)}）`
-    + `，跳过 ${skippedLogs} 条（登录/新增/配件等不迁的类型）`
-    + `，摊平成 ${opPayload.length} 行字段改动，实际写入 ${opsW} 行`);
-  stats.admin_operation_logs = {
-    read: opRows.length, written: opsW, fieldRows: opPayload.length,
-  };
+  // OperationLog → admin_operation_logs 已不再同步（2026-10-30）：adminpage 改为
+  // 直接写 PG 的 admin_operation_logs（表归 adminpage 所有，见
+  // adminpage-api/prisma/pg/006_admin_operation_logs.sql），OperationLog 停止写入。
+  // ⚠️ 不要恢复这一步 —— 那张表已经换成 adminpage 的结构，旧逻辑写不进去，
+  //    会让整轮同步事务回滚。
 
   return { stats };
 }

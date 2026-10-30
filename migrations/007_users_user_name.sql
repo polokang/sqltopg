@@ -32,13 +32,23 @@ CREATE INDEX IF NOT EXISTS users_user_name_idx ON users (user_name);
 -- 只动同步迁入的行（source='operation_log'）。第一条带 NOT EXISTS 守卫：表里一旦已有
 -- 'user_name' 行（本脚本跑过，或新版同步已经写入），就不再执行 —— 否则重跑时会把第二条
 -- 刚改好的 'name'（显示名）误改成 'user_name'。所以务必在部署新版同步**之前**跑。
-UPDATE admin_operation_logs
-   SET field = 'user_name'
- WHERE source = 'operation_log' AND target_type = 'user' AND field = 'name'
-   AND NOT EXISTS (SELECT 1 FROM admin_operation_logs x
-                    WHERE x.source = 'operation_log' AND x.target_type = 'user' AND x.field = 'user_name');
-UPDATE admin_operation_logs
-   SET field = 'name'
- WHERE source = 'operation_log' AND target_type = 'user' AND field = 'Name';
+--
+-- 2026-10-30：admin_operation_logs 已移交 adminpage 并换了结构（没有 field 列），
+-- 在新结构上跳过这一段，保证本脚本仍可重复执行。
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.columns
+              WHERE table_schema = 'public' AND table_name = 'admin_operation_logs'
+                AND column_name = 'field') THEN
+    UPDATE admin_operation_logs
+       SET field = 'user_name'
+     WHERE source = 'operation_log' AND target_type = 'user' AND field = 'name'
+       AND NOT EXISTS (SELECT 1 FROM admin_operation_logs x
+                        WHERE x.source = 'operation_log' AND x.target_type = 'user' AND x.field = 'user_name');
+    UPDATE admin_operation_logs
+       SET field = 'name'
+     WHERE source = 'operation_log' AND target_type = 'user' AND field = 'Name';
+  END IF;
+END $$;
 
 COMMIT;

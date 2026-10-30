@@ -289,28 +289,3 @@ DELETE FROM admin_controller_notes a
    AND a.source_id  = k.source_id
    AND a.source_seq >= k.keep
 `;
-
-// ─── admin_operation_logs ─────────────────────────────────────────────────────
-
-/**
- * 后台字段级改动审计。一条源日志改了 N 个字段就是 N 行，
- * 自然键 (source, source_id, source_seq) = ('operation_log', LogId, 第几个字段)。
- *
- * ⚠️ 用 DO NOTHING 而不是 DO UPDATE。源表是 identity 主键的**追加型**日志，
- *    旧行不会被改 —— 调用方只读 LogId > 已同步最大值 的增量（见 sync-simple.js），
- *    所以这里的冲突只可能来自"上一轮已经写过"，没有要更新的东西。
- */
-export const UPSERT_ADMIN_OPERATION_LOGS = `
-INSERT INTO admin_operation_logs
-  (occurred_at, actor_user_id, operation_type, target_type, target_id,
-   field, new_value, source, source_id, source_seq)
-SELECT x.occurred_at, x.actor_user_id, x.operation_type, x.target_type, x.target_id,
-       x.field, x.new_value, 'operation_log', x.source_id, x.source_seq
-  FROM jsonb_to_recordset($1::jsonb) AS x(
-    occurred_at timestamptz, actor_user_id int, operation_type varchar,
-    target_type varchar, target_id int, field varchar, new_value text,
-    source_id int, source_seq smallint
-  )
-ON CONFLICT (source, source_id, source_seq) WHERE source_id IS NOT NULL
-DO NOTHING
-`;

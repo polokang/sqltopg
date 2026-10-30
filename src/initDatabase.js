@@ -11,8 +11,7 @@
  *   ⚠️ users.managed_company_ids 是 Pro 人工维护的（不变式 I3），重建后回到派生初值，
  *      有人工配置时先备份。
  * 跨重建保留的表（CREATE TABLE IF NOT EXISTS）：controller_subscriptions ·
- *   controller_service_logs · controller_service_tasks · admin_controller_notes ·
- *   admin_operation_logs · sync_runs
+ *   controller_service_logs · controller_service_tasks · admin_controller_notes · sync_runs
  *
  * 命名规范：Aquareporter-pro/docs/migration/05-pg-naming-convention.md
  *   · 全部 lower_snake_case，永不加引号
@@ -22,7 +21,7 @@
  *
  * 不由本脚本管理、也不会被它碰到的表（adminpage 自有，见 adminpage-api/prisma/pg/*.sql）：
  *   admin_roles · admin_permissions · admin_role_permissions · admin_user_roles ·
- *   firmware_update_logs · product_labels · product_serial_counters
+ *   firmware_update_logs · product_labels · product_serial_counters · admin_operation_logs
  *
  * Run: npm run init-db
  */
@@ -31,7 +30,7 @@ import dotenv from 'dotenv';
 import pg from 'pg';
 import { getPostgresUrl } from './dbConfig.js';
 import {
-  COMM_TYPE, COMM_TYPE_VALUES, COMM_TYPE_EXCLUSIVE, OPERATION_TARGET_TYPES,
+  COMM_TYPE, COMM_TYPE_VALUES, COMM_TYPE_EXCLUSIVE,
   CASH_ACCOUNT_USER_ID,
 } from './derive.js';
 
@@ -39,8 +38,6 @@ dotenv.config();
 
 const { Client } = pg;
 
-/** admin_operation_logs.target_type 的 CHECK —— 取值清单只在 derive.js 里维护一份 */
-const TARGET_TYPE_SQL = OPERATION_TARGET_TYPES.map((t) => "'" + t + "'").join(', ');
 
 async function initDatabase() {
   const client = new Client({
@@ -694,94 +691,14 @@ async function initDatabase() {
     await client.query(`COMMENT ON COLUMN admin_controller_notes.created_by  IS '写备注的人。迁移行只有 16.8% 能从 OperationLog 反推出来，其余为 NULL'`);
     await client.query(`COMMENT ON COLUMN admin_controller_notes.occurred_on IS '日志时间 → 正文里的日期 → 设备建档日期。等于 created_at::date 时是兜底值，不是真实发生日'`);
 
-    // ── 14. admin_operation_logs —— 后台改动审计（仅内部可见）─────────────────
+    // ── 14. admin_operation_logs —— 已移交 adminpage ─────────────────────────
     //
-    // 一行回答一个问题：**谁 · 什么时候 · 把哪条记录的哪个字段 · 改成了什么**。
-    //
-    // ⚠️ 这不是 SQL Server `OperationLog` 的镜像。那张表一行存两份整行快照
-    //    （47-52 列的 JSON），臃肿且查不动 —— 想知道"这台设备的 SystemID 被谁改过"
-    //    只能 `WHERE updated_record::text LIKE '%…%'` 再人工比对两份 JSON。
-    //    这里把它**摊平成字段级改动**：一条源日志改了 3 个字段就是 3 行。
-    //    9653 行（2026-09-22）覆盖了源库 4895 条相关日志。
-    //
-    // ⚠️ **不存改动前的值。** 需求只要"改成了什么"；存旧值要么整行翻倍，要么就得
-    //    保留那两份快照，正好是这次要甩掉的东西。真要回溯某一刻的完整状态，
-    //    按 (target_type, target_id) 把这张表从头放一遍即可。
-    //
-    // 迁移口径与两种源格式的处理都在 derive.js 的 deriveOperationLogRows：
-    //   · 只迁设备与用户的修改，外加续费（UPDATE_RENEWAL 按台拆行）
-    //   · LOGIN / LOGINTOREPORT 不迁 —— 那两类的 UpdatedRecord 是 8 小时有效的
-    //     登录 JWT 原文，每天同步等于把还能用的 bearer token 复制进一张随便谁
-    //     都能查的审计表
-    //   · ADD_CONTROLLER / ADD_USER / RELEASE_CONTROLLER 不迁 —— 整条新增没有
-    //     "改成什么"可记，全展开是 6 万行建档噪音
-    //   · 明文密码列不记，只留 password_hash 一行、值抹成 '***'
-    //
-    // field 用的是 **PG 的列名**（`creator` 而不是 `SiteLocation`），映射表在
-    // derive.js。PG 里没有的列保持源列名 —— 那是当年真的改过的东西，不能因为
-    // 现在不迁就假装没发生。
-    //
-    // ⚠️ 同样是 CREATE TABLE IF NOT EXISTS 且不在 DROP 列表里 —— 审计数据，
-    //    重建镜像表不能清掉。actor_user_id / target_id 不加外键，理由同前。
-    console.log('Creating admin_operation_logs (preserved across rebuilds)...');
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS admin_operation_logs (
-        id             BIGSERIAL   PRIMARY KEY,
-        occurred_at    TIMESTAMPTZ NOT NULL,
-        actor_user_id  INTEGER,
-        operation_type VARCHAR(30) NOT NULL,
-        target_type    VARCHAR(20) NOT NULL
-                         CONSTRAINT admin_operation_logs_target_type_valid
-                         CHECK (target_type IN (${TARGET_TYPE_SQL})),
-        target_id      INTEGER     NOT NULL,
-        field          VARCHAR(50) NOT NULL,
-        -- NULL 表示这个字段被清空了，与"没记"区分开
-        new_value      TEXT,
-        source         VARCHAR(30) NOT NULL DEFAULT 'manual'
-                         CONSTRAINT admin_operation_logs_source_valid
-                         CHECK (source IN ('manual', 'operation_log')),
-        source_id      INTEGER,
-        -- 同一条源日志拆出的第几行（一次改 N 个字段就有 N 行）
-        source_seq     SMALLINT
-      );
-    `);
-    // 建表用的是 IF NOT EXISTS —— 表已存在时整段会被跳过，所以 CHECK 都起了
-    // 显式名字，这里按名字幂等重建（同 controller_subscriptions 的处理）
-    for (const [name, expr] of [
-      ['admin_operation_logs_target_type_valid', `target_type IN (${TARGET_TYPE_SQL})`],
-      ['admin_operation_logs_source_valid', `source IN ('manual', 'operation_log')`],
-    ]) {
-      await client.query(`
-        DO $$ BEGIN
-          IF NOT EXISTS (SELECT 1 FROM pg_constraint
-                          WHERE conrelid = 'admin_operation_logs'::regclass
-                            AND conname = '${name}') THEN
-            ALTER TABLE admin_operation_logs ADD CONSTRAINT ${name} CHECK (${expr});
-          END IF;
-        END $$;`);
-    }
-    await client.query(`
-      CREATE UNIQUE INDEX IF NOT EXISTS admin_operation_logs_source_idx
-        ON admin_operation_logs (source, source_id, source_seq)
-        WHERE source_id IS NOT NULL;`);
-    // "这台设备/这个用户被谁改过" —— 这张表存在的理由，也是唯一必须快的查询
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS admin_operation_logs_target_idx
-        ON admin_operation_logs (target_type, target_id, occurred_at DESC);`);
-    // "这个字段历史上都被改成过什么"（例如某台设备的 sim_card_no 变更史）
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS admin_operation_logs_field_idx
-        ON admin_operation_logs (target_type, target_id, field, occurred_at DESC);`);
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS admin_operation_logs_actor_idx
-        ON admin_operation_logs (actor_user_id, occurred_at DESC);`);
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS admin_operation_logs_occurred_idx
-        ON admin_operation_logs (occurred_at DESC);`);
-    await client.query(`COMMENT ON TABLE  admin_operation_logs                IS '后台字段级改动审计（旧 OperationLog 摊平）。⚠️ 仅内部可见；不存旧值；登录事件与新增事件不迁；明文密码抹成 ***'`);
-    await client.query(`COMMENT ON COLUMN admin_operation_logs.actor_user_id  IS '做这次改动的人（源列 UserId），不是被改的对象'`);
-    await client.query(`COMMENT ON COLUMN admin_operation_logs.field          IS 'PG 列名；PG 里没有的列保持源列名（如 SetupVersionId）'`);
-    await client.query(`COMMENT ON COLUMN admin_operation_logs.new_value      IS '改成了什么。NULL = 被清空；密码类一律 ***'`);
+    // 2026-10-30 起这张表归 adminpage 所有、由 adminpage 直接写入，结构也换了
+    // （一次修改一行 + old_values / new_values），建表脚本在
+    // adminpage-api/prisma/pg/006_admin_operation_logs.sql。本脚本不再建它、
+    // 不再给它补约束，sync 也不再从 OperationLog 同步。
+    // ⚠️ 不要把这里的旧建表语句加回来：IF NOT EXISTS 虽然会跳过建表，但后面
+    //    按名字补 CHECK 约束那段会引用已经不存在的 source 列，init-db 会直接失败。
 
 
     // ── 15. Views ────────────────────────────────────────────────────────────

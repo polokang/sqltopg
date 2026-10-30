@@ -32,6 +32,7 @@ src/
 └── progress.js              # 进度条（只被 migration-* 使用）
 
 migrations/                  # 不能重建的环境用的幂等原地升级脚本（见「原地升级」）
+docs/sync-map.md             # ★ 同步关系总览：哪张源表 → 哪张 PG 表、读取方式、删除语义
 .env.example                 # 带注释的环境变量模板
 docker-compose.yml           # 生产部署（镜像 adminpage.azurecr.io/sqltopg）
 ```
@@ -39,6 +40,8 @@ docker-compose.yml           # 生产部署（镜像 adminpage.azurecr.io/sqltop
 ---
 
 ## PG 表一览
+
+> 只想看"哪张 SQL Server 表同步到哪张 PG 表"，直接看 [docs/sync-map.md](docs/sync-map.md)。
 
 命名规范：`Aquareporter-pro/docs/migration/05-pg-naming-convention.md`（全部 lower_snake_case、表名复数）。
 建表脚本 `src/initDatabase.js` 是唯一权威。
@@ -64,9 +67,11 @@ docker-compose.yml           # 生产部署（镜像 adminpage.azurecr.io/sqltop
 | `controller_service_logs` | `dbo.ControllerNotes` | **客户可见**的现场服务记录；Pro 自建行 `source='manual'` |
 | `controller_service_tasks` | `ControllerInfo.Action` | **客户可见**的派工任务；status / assigned_to 等工作状态同步不碰 |
 | `controller_subscriptions` | `ControllerInfo.RenewalInv/Date` | 通信套餐。迁来的记 `kind='legacy'`；`paid_by_user_id` 取设备 owner，无则现金账户 5040 |
-| `admin_controller_notes` | `ControllerInfo.Notes` | **仅内部**。按 `-->` 拆成多行；作者从 OperationLog 反推（只覆盖 16.8%） |
-| `admin_operation_logs` | `dbo.OperationLog` | **仅内部**审计，一行一个字段改动；不存旧值；登录与新增事件不迁；明文密码抹成 `***` |
+| `admin_controller_notes` | `ControllerInfo.Notes` | **仅内部**。按 `-->` 拆成多行；作者从 OperationLog 历史反推（只覆盖 16.8%，2026-10-30 之后的新备注没有作者） |
 | `sync_runs` | 本项目自己写 | 每轮同步一行，见「运行日志」 |
+
+> `admin_operation_logs` 原来也在这里（从 `OperationLog` 摊平同步）。**2026-10-30 起移交 adminpage**，
+> 由 adminpage 直接写入、结构也换了，本项目不再建表、不再同步。见 [docs/sync-map.md](docs/sync-map.md) 第 5 节。
 
 这几张表的 `unit_id` / `user_id` 引用**故意不加外键** —— `init-db` 的 `DROP TABLE controllers CASCADE`
 会静默删掉引用它的外键约束。
@@ -74,10 +79,10 @@ docker-compose.yml           # 生产部署（镜像 adminpage.azurecr.io/sqltop
 ### 不归本项目管的表（adminpage 自有，`init-db` 不碰）
 
 `admin_roles` · `admin_permissions` · `admin_role_permissions` · `admin_user_roles` · `firmware_update_logs` ·
-`product_labels` · `product_serial_counters`。基线脚本在 `adminpage/adminpage-api/prisma/pg/`。
+`product_labels` · `product_serial_counters` · `admin_operation_logs`。建表脚本在 `adminpage/adminpage-api/prisma/pg/`。
 
-> ⚠️ `admin_` 前缀不代表归属。`admin_controller_notes` / `admin_operation_logs` **是本项目建的**，
-> 前缀只是在说"仅内部可见"。它们对应的客户侧表是 `controller_service_logs` / `controller_service_tasks` ——
+> ⚠️ `admin_` 前缀不代表归属。`admin_controller_notes` **是本项目建的**，前缀只是在说"仅内部可见"；
+> `admin_operation_logs` 则归 adminpage。`admin_controller_notes` 对应的客户侧表是 `controller_service_logs` ——
 > 差别只在受众，但那正是最容易出事的地方，写查询前先看清楚用的是哪一张。
 
 > ⚠️ **源库两种时区约定并存。** `OperationLog.OperationTime` 是真 UTC，而 `ControllerInfo` / `UserInfomation` /
@@ -112,7 +117,7 @@ docker-compose.yml           # 生产部署（镜像 adminpage.azurecr.io/sqltop
 
 ```
 companies → users → controllers → user_controller_assignments → 回填 companies.manager_user_id
-          → controller_service_logs / _tasks / controller_subscriptions → admin_controller_notes / admin_operation_logs
+          → controller_service_logs / _tasks / controller_subscriptions → admin_controller_notes
 ```
 
 每张表都必须明确**删除语义**（新增同步表时也一样）：
@@ -124,7 +129,6 @@ companies → users → controllers → user_controller_assignments → 回填 c
 | `controller_service_logs` | ⚠️ 目前不删（待补，方案 A 阶段 0.5） |
 | `controller_service_tasks` / `controller_subscriptions` | 不删（按 source 键 UPSERT） |
 | `admin_controller_notes` | 源备注段数变少时删掉尾部多出的行；`source='manual'` 不碰 |
-| `admin_operation_logs` | 追加型，`DO NOTHING` |
 
 ### 必须知道的约定
 
@@ -251,9 +255,9 @@ psql "$POSTGRESQL_URL" -v ON_ERROR_STOP=1 -f migrations/<文件>.sql
 | 文件 | 内容 |
 |---|---|
 | `001_rename_to_snake_case.sql` | 旧 PascalCase schema 改名为 snake_case（历史） |
-| `004_admin_notes_and_operation_logs.sql` | `creator` / `accessory_serial_numbers` 改名、`admin_controller_notes`、`admin_operation_logs`、`paid_by_user_id` |
+| `004_admin_notes_and_operation_logs.sql` | `creator` / `accessory_serial_numbers` 改名、`admin_controller_notes`、`admin_operation_logs`、`paid_by_user_id`。⚠️ 其中 `admin_operation_logs` 部分已作废（表已移交 adminpage）：**执行过 adminpage `006` 的库上不要再跑本脚本**，它会给新表加索引 / 约束而失败 |
 | `005_sync_source_users_controllers.sql` | `users` / `controllers` 加回 `sync_source`（修同步竞态）。**部署新版同步服务前先跑** |
-| `007_users_user_name.sql` | `users` 新增 `user_name`（老站登录名），`name` 改为显示名；对齐 `admin_operation_logs` 历史字段名。**部署新版同步服务前先跑** |
+| `007_users_user_name.sql` | `users` 新增 `user_name`（老站登录名），`name` 改为显示名；对齐 `admin_operation_logs` 历史字段名（表已换成 adminpage 的新结构时自动跳过这一步）。**部署新版同步服务前先跑** |
 | `006_avatar_and_last_login.sql` | 清掉历史上从 `Logo` 灌进来的 `avatar_url`、按旧口径（快 10 小时）存的 `last_login_at`。**部署新版同步服务后、Pro 上线前跑一次** |
 | `archive/` | 已被 `initDatabase.js` 取代的历史脚本，**不要执行**（002 删 `sync_source` 的决定已被 005 反转） |
 
